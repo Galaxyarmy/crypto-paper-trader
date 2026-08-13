@@ -5,8 +5,8 @@
     "num_trades": 0
   },
   "ETHUSDT": {
-    "cash": 5000.0,
-    "coin_qty": 0.0,
-    "num_trades": 0
+    "cash": 0.0,
+    "coin_qty": 2.643640443729359,
+    "num_trades": 1
   }
 }
