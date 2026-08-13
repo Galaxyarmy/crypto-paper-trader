@@ -38,7 +38,7 @@ RSI_OVERBOUGHT = 70
 
 STATE_FILE = "state.json"
 LOG_FILE = "trade_log.csv"
-BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+BINANCE_KLINES_URL = "https://data-api.binance.vision/api/v3/klines"
 
 # ------------------------------------------------------------
 
