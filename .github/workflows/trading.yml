@@ -1,0 +1,35 @@
+name: Crypto Paper Trading Agent
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests pandas
+
+      - name: Run trading agent
+        run: python paper_trader.py
+
+      - name: Commit updated state
+        run: |
+          git config user.name "trading-bot"
+          git config user.email "trading-bot@users.noreply.github.com"
+          git add state.json trade_log.csv
+          git diff --quiet --cached || git commit -m "Update paper trading state [skip ci]"
+          git push
