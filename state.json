@@ -1,0 +1,12 @@
+{
+  "BTCUSDT": {
+    "cash": 5000.0,
+    "coin_qty": 0.0,
+    "num_trades": 0
+  },
+  "ETHUSDT": {
+    "cash": 5000.0,
+    "coin_qty": 0.0,
+    "num_trades": 0
+  }
+}

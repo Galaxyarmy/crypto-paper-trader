@@ -1,0 +1,3 @@
+timestamp,symbol,action,price,qty,cash,coin_qty,portfolio_value
+2026-08-13T11:13:18.650262+00:00,BTCUSDT,HOLD,63614.77,0.0,5000.0,0.0,5000.0
+2026-08-13T11:13:18.650262+00:00,ETHUSDT,HOLD,1881.34,0.0,5000.0,0.0,5000.0
