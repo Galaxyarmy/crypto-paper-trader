@@ -1,17 +1,22 @@
 """
-Crypto Paper Trading Agent — single-run version for GitHub Actions.
+Crypto Paper Trading Agent v2 — single-run version for GitHub Actions.
+
+New in v2:
+- Stop-loss: auto-exit a position if price drops STOP_LOSS_PCT below entry
+- Position sizing: only deploy POSITION_SIZE_PCT of available cash per trade
+  (rest stays in reserve, reducing risk of one bad trade wiping the account)
+- Fee-aware entry filter: skip BUY signals unless the recent move is big
+  enough to plausibly cover round-trip fees
+- Daily loss limit: if a coin's value drops more than MAX_DAILY_LOSS_PCT
+  from its start-of-day value, pause trading that coin for the rest of the day
 
 Each run:
 1. Loads wallet state from state.json (or creates fresh state if missing)
-2. Fetches latest candles for BTC/USDT and ETH/USDT from Binance public API
+2. Fetches latest candles for BTC/USDT and ETH/USDT
 3. Computes EMA9/EMA21 crossover + RSI signal
-4. Simulates BUY/SELL if signal fires
+4. Applies risk filters, then simulates BUY/SELL if signal fires
 5. Appends the decision to trade_log.csv
 6. Saves updated wallet state back to state.json
-
-GitHub Actions is expected to call this script on a schedule (e.g. every
-15 minutes) and commit state.json + trade_log.csv back to the repo after
-each run, so state persists across runs.
 
 Requirements: pip install requests pandas
 """
@@ -27,7 +32,7 @@ import pandas as pd
 # ------------------------- CONFIG -------------------------
 
 COINS = ["BTCUSDT", "ETHUSDT"]
-INTERVAL = "15m"
+INTERVAL = "5m"
 STARTING_CASH_PER_COIN = 5000.0
 FEE_PCT = 0.001
 
@@ -35,6 +40,12 @@ EMA_SHORT = 9
 EMA_LONG = 21
 RSI_PERIOD = 14
 RSI_OVERBOUGHT = 70
+
+# --- risk management ---
+STOP_LOSS_PCT = 0.02          # exit if price falls 2% below entry
+POSITION_SIZE_PCT = 0.5       # only deploy 50% of available cash per buy
+MIN_MOVE_PCT = 0.004          # skip buy unless recent move >= 0.4% (covers ~2x round-trip fee)
+MAX_DAILY_LOSS_PCT = 0.03     # stop trading a coin for the day after 3% daily loss
 
 STATE_FILE = "state.json"
 LOG_FILE = "trade_log.csv"
@@ -47,8 +58,21 @@ def load_state() -> dict:
     if os.path.isfile(STATE_FILE):
         with open(STATE_FILE) as f:
             return json.load(f)
+    return default_state()
+
+
+def default_state() -> dict:
+    today = datetime.now(timezone.utc).date().isoformat()
     return {
-        symbol: {"cash": STARTING_CASH_PER_COIN, "coin_qty": 0.0, "num_trades": 0}
+        symbol: {
+            "cash": STARTING_CASH_PER_COIN,
+            "coin_qty": 0.0,
+            "num_trades": 0,
+            "entry_price": None,
+            "day": today,
+            "day_start_value": STARTING_CASH_PER_COIN,
+            "day_halted": False,
+        }
         for symbol in COINS
     }
 
@@ -101,18 +125,39 @@ def generate_signal(df: pd.DataFrame) -> str:
     return "HOLD"
 
 
+def recent_move_pct(df: pd.DataFrame, lookback: int = 5) -> float:
+    """Rough measure of recent momentum, used as a fee-aware filter."""
+    recent = df["close"].iloc[-lookback:]
+    return abs(recent.iloc[-1] - recent.iloc[0]) / recent.iloc[0]
+
+
+def reset_day_if_needed(wallet: dict, price: float):
+    today = datetime.now(timezone.utc).date().isoformat()
+    if wallet.get("day") != today:
+        wallet["day"] = today
+        wallet["day_start_value"] = wallet["cash"] + wallet["coin_qty"] * price
+        wallet["day_halted"] = False
+
+
 def log_row(row: list):
     file_exists = os.path.isfile(LOG_FILE)
     with open(LOG_FILE, "a", newline="") as f:
         writer = csv.writer(f)
         if not file_exists:
-            writer.writerow(["timestamp", "symbol", "action", "price", "qty",
+            writer.writerow(["timestamp", "symbol", "action", "reason", "price", "qty",
                               "cash", "coin_qty", "portfolio_value"])
         writer.writerow(row)
 
 
 def main():
     state = load_state()
+    # migrate old-format state (from v1) if needed
+    for symbol in COINS:
+        if symbol not in state:
+            state[symbol] = default_state()[symbol]
+        for key, default_val in default_state()[symbol].items():
+            state[symbol].setdefault(key, default_val)
+
     timestamp = datetime.now(timezone.utc).isoformat()
 
     for symbol in COINS:
@@ -121,29 +166,62 @@ def main():
             df = compute_indicators(df)
             signal = generate_signal(df)
             price = float(df.iloc[-1]["close"])
+            move = recent_move_pct(df)
 
             wallet = state[symbol]
+            reset_day_if_needed(wallet, price)
 
-            if signal == "BUY" and wallet["cash"] > 0:
-                fee = wallet["cash"] * FEE_PCT
-                usable_cash = wallet["cash"] - fee
-                wallet["coin_qty"] += usable_cash / price
-                wallet["cash"] = 0.0
-                wallet["num_trades"] += 1
+            reason = signal
 
-            elif signal == "SELL" and wallet["coin_qty"] > 0:
-                proceeds = wallet["coin_qty"] * price
-                fee = proceeds * FEE_PCT
-                wallet["cash"] += proceeds - fee
-                wallet["coin_qty"] = 0.0
-                wallet["num_trades"] += 1
+            if wallet["day_halted"]:
+                reason = "DAILY_LOSS_HALT"
+
+            # --- stop-loss check first (applies even if halted) ---
+            elif wallet["coin_qty"] > 0 and wallet["entry_price"]:
+                loss_pct = (wallet["entry_price"] - price) / wallet["entry_price"]
+                if loss_pct >= STOP_LOSS_PCT:
+                    proceeds = wallet["coin_qty"] * price
+                    fee = proceeds * FEE_PCT
+                    wallet["cash"] += proceeds - fee
+                    wallet["coin_qty"] = 0.0
+                    wallet["entry_price"] = None
+                    wallet["num_trades"] += 1
+                    reason = "STOP_LOSS"
+
+                elif signal == "SELL":
+                    proceeds = wallet["coin_qty"] * price
+                    fee = proceeds * FEE_PCT
+                    wallet["cash"] += proceeds - fee
+                    wallet["coin_qty"] = 0.0
+                    wallet["entry_price"] = None
+                    wallet["num_trades"] += 1
+                    reason = "SELL"
+
+            elif signal == "BUY" and wallet["cash"] > 0:
+                if move < MIN_MOVE_PCT:
+                    reason = "SKIP_SMALL_MOVE"
+                else:
+                    spend = wallet["cash"] * POSITION_SIZE_PCT
+                    fee = spend * FEE_PCT
+                    usable = spend - fee
+                    wallet["coin_qty"] += usable / price
+                    wallet["cash"] -= spend
+                    wallet["entry_price"] = price
+                    wallet["num_trades"] += 1
+                    reason = "BUY"
 
             value = wallet["cash"] + wallet["coin_qty"] * price
-            log_row([timestamp, symbol, signal, price, wallet["coin_qty"],
+
+            # check daily loss limit for next run
+            day_loss_pct = (wallet["day_start_value"] - value) / wallet["day_start_value"]
+            if day_loss_pct >= MAX_DAILY_LOSS_PCT:
+                wallet["day_halted"] = True
+
+            log_row([timestamp, symbol, signal, reason, price, wallet["coin_qty"],
                      wallet["cash"], wallet["coin_qty"], value])
 
             print(f"[{timestamp}] {symbol}: price=${price:.2f} signal={signal} "
-                  f"portfolio=${value:.2f}")
+                  f"reason={reason} portfolio=${value:.2f}")
 
         except Exception as e:
             print(f"[{timestamp}] Error processing {symbol}: {e}")
