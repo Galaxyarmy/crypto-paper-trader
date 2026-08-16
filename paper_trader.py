@@ -1,22 +1,16 @@
-"""
-Crypto Paper Trading Agent v2 — single-run version for GitHub Actions.
 
-New in v2:
-- Stop-loss: auto-exit a position if price drops STOP_LOSS_PCT below entry
-- Position sizing: only deploy POSITION_SIZE_PCT of available cash per trade
-  (rest stays in reserve, reducing risk of one bad trade wiping the account)
-- Fee-aware entry filter: skip BUY signals unless the recent move is big
-  enough to plausibly cover round-trip fees
-- Daily loss limit: if a coin's value drops more than MAX_DAILY_LOSS_PCT
-  from its start-of-day value, pause trading that coin for the rest of the day
+code = '''"""
+Crypto Paper Trading Agent v3.1 — Hardened Single-Run Edition (Fixed)
 
-Each run:
-1. Loads wallet state from state.json (or creates fresh state if missing)
-2. Fetches latest candles for BTC/USDT and ETH/USDT
-3. Computes EMA9/EMA21 crossover + RSI signal
-4. Applies risk filters, then simulates BUY/SELL if signal fires
-5. Appends the decision to trade_log.csv
-6. Saves updated wallet state back to state.json
+Fixes over v3:
+- Orphaned position recovery
+- True Wilder RSI (exponential smoothing)
+- ACTION vs SIGNAL separation in logs
+- State schema versioning with SAFE migration (preserves v3 flat format)
+- Log file renamed to v3_1 to avoid schema collision
+- Pre-flight daily-loss guard
+- Debug columns (ema_short, ema_long, rsi) in CSV
+- Defensive API retry with exponential backoff
 
 Requirements: pip install requests pandas
 """
@@ -24,6 +18,7 @@ Requirements: pip install requests pandas
 import json
 import csv
 import os
+import time
 from datetime import datetime, timezone
 
 import requests
@@ -41,40 +36,80 @@ EMA_LONG = 21
 RSI_PERIOD = 14
 RSI_OVERBOUGHT = 70
 
-# --- risk management ---
-STOP_LOSS_PCT = 0.02          # exit if price falls 2% below entry
-POSITION_SIZE_PCT = 0.5       # only deploy 50% of available cash per buy
-MIN_MOVE_PCT = 0.004          # skip buy unless recent move >= 0.4% (covers ~2x round-trip fee)
-MAX_DAILY_LOSS_PCT = 0.03     # stop trading a coin for the day after 3% daily loss
+STOP_LOSS_PCT = 0.02
+POSITION_SIZE_PCT = 0.5
+MIN_MOVE_PCT = 0.004
+MAX_DAILY_LOSS_PCT = 0.03
 
 STATE_FILE = "state.json"
-LOG_FILE = "trade_log.csv"
+LOG_FILE = "trade_log_v3_1.csv"  # NEW file — avoids schema collision with v3
 BINANCE_KLINES_URL = "https://data-api.binance.vision/api/v3/klines"
 
+SCHEMA_VERSION = 2
+
 # ------------------------------------------------------------
-
-
-def load_state() -> dict:
-    if os.path.isfile(STATE_FILE):
-        with open(STATE_FILE) as f:
-            return json.load(f)
-    return default_state()
 
 
 def default_state() -> dict:
     today = datetime.now(timezone.utc).date().isoformat()
     return {
-        symbol: {
-            "cash": STARTING_CASH_PER_COIN,
-            "coin_qty": 0.0,
-            "num_trades": 0,
-            "entry_price": None,
-            "day": today,
-            "day_start_value": STARTING_CASH_PER_COIN,
-            "day_halted": False,
+        "schema_version": SCHEMA_VERSION,
+        "coins": {
+            symbol: {
+                "cash": STARTING_CASH_PER_COIN,
+                "coin_qty": 0.0,
+                "num_trades": 0,
+                "entry_price": None,
+                "day": today,
+                "day_start_value": STARTING_CASH_PER_COIN,
+                "day_halted": False,
+            }
+            for symbol in COINS
         }
-        for symbol in COINS
     }
+
+
+def load_state() -> dict:
+    if os.path.isfile(STATE_FILE):
+        with open(STATE_FILE) as f:
+            state = json.load(f)
+    else:
+        state = {}
+
+    # ---- SAFE MIGRATION from v3 (flat format) to v3.1 (wrapped format) ----
+    # v3 format: {"BTCUSDT": {...}, "ETHUSDT": {...}, ...}
+    # v3.1 format: {"schema_version": 2, "coins": {"BTCUSDT": {...}, ...}}
+    if "coins" not in state:
+        # Could be v3 flat format OR completely fresh
+        migrated_coins = {}
+        has_v3_data = False
+        for symbol in COINS:
+            if symbol in state:
+                # v3 flat data found — preserve it!
+                migrated_coins[symbol] = state[symbol]
+                has_v3_data = True
+            else:
+                # Fresh start for this coin
+                migrated_coins[symbol] = default_state()["coins"][symbol]
+
+        # Rebuild state cleanly
+        new_state = default_state()
+        new_state["coins"] = migrated_coins
+        state = new_state
+
+        if has_v3_data:
+            print(f"[INFO] Migrated v3 flat state to v3.1 wrapped format. Data preserved.")
+    else:
+        # Already v3.1+ format — just ensure all keys exist
+        defaults = default_state()
+        for symbol in COINS:
+            if symbol not in state["coins"]:
+                state["coins"][symbol] = defaults["coins"][symbol]
+            for key, default_val in defaults["coins"][symbol].items():
+                state["coins"][symbol].setdefault(key, default_val)
+
+    state["schema_version"] = SCHEMA_VERSION
+    return state
 
 
 def save_state(state: dict):
@@ -82,18 +117,35 @@ def save_state(state: dict):
         json.dump(state, f, indent=2)
 
 
-def fetch_candles(symbol: str, interval: str, limit: int = 100) -> pd.DataFrame:
+def fetch_closed_candles(symbol: str, interval: str, limit: int = 101, retries: int = 3) -> pd.DataFrame:
+    """Fetch candles and drop the last one, which may still be forming.
+    Retries with exponential backoff on transient failures."""
     params = {"symbol": symbol, "interval": interval, "limit": limit}
-    resp = requests.get(BINANCE_KLINES_URL, params=params, timeout=10)
-    resp.raise_for_status()
-    data = resp.json()
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            resp = requests.get(BINANCE_KLINES_URL, params=params, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            break
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                sleep_sec = 2 ** attempt
+                print(f"[WARN] {symbol} API attempt {attempt} failed, retrying in {sleep_sec}s...")
+                time.sleep(sleep_sec)
+            else:
+                raise last_err
+
     df = pd.DataFrame(data, columns=[
         "open_time", "open", "high", "low", "close", "volume",
         "close_time", "quote_asset_volume", "trades",
         "taker_buy_base", "taker_buy_quote", "ignore"
     ])
     df["close"] = df["close"].astype(float)
-    return df
+    df["high"] = df["high"].astype(float)
+    df["low"] = df["low"].astype(float)
+    return df.iloc[:-1].reset_index(drop=True)
 
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -103,8 +155,10 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     delta = df["close"].diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
-    avg_gain = gain.rolling(RSI_PERIOD).mean()
-    avg_loss = loss.rolling(RSI_PERIOD).mean()
+
+    # Wilder RSI (exponential smoothing) — matches TradingView/Binance
+    avg_gain = gain.ewm(alpha=1 / RSI_PERIOD, min_periods=RSI_PERIOD).mean()
+    avg_loss = loss.ewm(alpha=1 / RSI_PERIOD, min_periods=RSI_PERIOD).mean()
     rs = avg_gain / avg_loss.replace(0, 1e-9)
     df["rsi"] = 100 - (100 / (1 + rs))
 
@@ -126,9 +180,11 @@ def generate_signal(df: pd.DataFrame) -> str:
 
 
 def recent_move_pct(df: pd.DataFrame, lookback: int = 5) -> float:
-    """Rough measure of recent momentum, used as a fee-aware filter."""
-    recent = df["close"].iloc[-lookback:]
-    return abs(recent.iloc[-1] - recent.iloc[0]) / recent.iloc[0]
+    """ATR-style volatility: average high-low range over lookback."""
+    recent = df.iloc[-lookback:]
+    avg_range = (recent["high"] - recent["low"]).mean()
+    latest_close = df.iloc[-1]["close"]
+    return avg_range / latest_close
 
 
 def reset_day_if_needed(wallet: dict, price: float):
@@ -144,90 +200,126 @@ def log_row(row: list):
     with open(LOG_FILE, "a", newline="") as f:
         writer = csv.writer(f)
         if not file_exists:
-            writer.writerow(["timestamp", "symbol", "action", "reason", "price", "qty",
-                              "cash", "coin_qty", "portfolio_value"])
+            writer.writerow([
+                "timestamp", "symbol", "action", "signal", "reason", "price",
+                "trade_qty", "cash", "coin_qty", "portfolio_value",
+                "ema_short", "ema_long", "rsi"
+            ])
         writer.writerow(row)
 
 
 def main():
     state = load_state()
-    # migrate old-format state (from v1) if needed
-    for symbol in COINS:
-        if symbol not in state:
-            state[symbol] = default_state()[symbol]
-        for key, default_val in default_state()[symbol].items():
-            state[symbol].setdefault(key, default_val)
-
     timestamp = datetime.now(timezone.utc).isoformat()
 
     for symbol in COINS:
         try:
-            df = fetch_candles(symbol, INTERVAL)
+            df = fetch_closed_candles(symbol, INTERVAL)
             df = compute_indicators(df)
             signal = generate_signal(df)
             price = float(df.iloc[-1]["close"])
             move = recent_move_pct(df)
 
-            wallet = state[symbol]
+            wallet = state["coins"][symbol]
             reset_day_if_needed(wallet, price)
 
+            # ---- Orphaned position recovery ----
+            if wallet["coin_qty"] > 0 and wallet.get("entry_price") is None:
+                print(f"[WARN] {symbol}: coin_qty={wallet['coin_qty']} but entry_price missing. "
+                      f"Auto-setting entry_price to current price ${price:.2f}")
+                wallet["entry_price"] = price
+
             reason = signal
+            action = "HOLD"
+            trade_qty = 0.0
 
-            if wallet["day_halted"]:
-                reason = "DAILY_LOSS_HALT"
-
-            # --- stop-loss check first (applies even if halted) ---
-            elif wallet["coin_qty"] > 0 and wallet["entry_price"]:
+            # --- 1. STOP-LOSS: always checked first ---
+            if wallet["coin_qty"] > 0 and wallet["entry_price"] is not None:
                 loss_pct = (wallet["entry_price"] - price) / wallet["entry_price"]
                 if loss_pct >= STOP_LOSS_PCT:
-                    proceeds = wallet["coin_qty"] * price
+                    trade_qty = wallet["coin_qty"]
+                    proceeds = trade_qty * price
                     fee = proceeds * FEE_PCT
                     wallet["cash"] += proceeds - fee
                     wallet["coin_qty"] = 0.0
                     wallet["entry_price"] = None
                     wallet["num_trades"] += 1
+                    action = "SELL"
                     reason = "STOP_LOSS"
 
                 elif signal == "SELL":
-                    proceeds = wallet["coin_qty"] * price
+                    trade_qty = wallet["coin_qty"]
+                    proceeds = trade_qty * price
                     fee = proceeds * FEE_PCT
                     wallet["cash"] += proceeds - fee
                     wallet["coin_qty"] = 0.0
                     wallet["entry_price"] = None
                     wallet["num_trades"] += 1
+                    action = "SELL"
                     reason = "SELL"
 
+                elif wallet["day_halted"]:
+                    action = "HOLD"
+                    reason = "DAILY_LOSS_HALT"
+
+            # --- 2. Flat wallet logic ---
+            elif wallet["day_halted"]:
+                action = "HOLD"
+                reason = "DAILY_LOSS_HALT"
+
             elif signal == "BUY" and wallet["cash"] > 0:
-                if move < MIN_MOVE_PCT:
+                # Pre-flight: if already near daily limit, skip new entry
+                hypothetical_value = wallet["cash"] + wallet["coin_qty"] * price
+                hypothetical_loss = (wallet["day_start_value"] - hypothetical_value) / wallet["day_start_value"]
+                if hypothetical_loss >= MAX_DAILY_LOSS_PCT * 0.9:
+                    action = "HOLD"
+                    reason = "SKIP_NEAR_DAILY_LIMIT"
+                elif move < MIN_MOVE_PCT:
+                    action = "HOLD"
                     reason = "SKIP_SMALL_MOVE"
                 else:
                     spend = wallet["cash"] * POSITION_SIZE_PCT
                     fee = spend * FEE_PCT
                     usable = spend - fee
-                    wallet["coin_qty"] += usable / price
+                    trade_qty = usable / price
+                    wallet["coin_qty"] += trade_qty
                     wallet["cash"] -= spend
                     wallet["entry_price"] = price
                     wallet["num_trades"] += 1
+                    action = "BUY"
                     reason = "BUY"
 
+            # --- 3. Post-trade daily loss check ---
             value = wallet["cash"] + wallet["coin_qty"] * price
-
-            # check daily loss limit for next run
             day_loss_pct = (wallet["day_start_value"] - value) / wallet["day_start_value"]
             if day_loss_pct >= MAX_DAILY_LOSS_PCT:
                 wallet["day_halted"] = True
 
-            log_row([timestamp, symbol, signal, reason, price, wallet["coin_qty"],
-                     wallet["cash"], wallet["coin_qty"], value])
+            # Debug values from latest closed candle
+            ema_s = float(df.iloc[-1]["ema_short"])
+            ema_l = float(df.iloc[-1]["ema_long"])
+            rsi_v = float(df.iloc[-1]["rsi"])
+
+            log_row([
+                timestamp, symbol, action, signal, reason, price, trade_qty,
+                wallet["cash"], wallet["coin_qty"], value,
+                round(ema_s, 2), round(ema_l, 2), round(rsi_v, 2)
+            ])
 
             print(f"[{timestamp}] {symbol}: price=${price:.2f} signal={signal} "
-                  f"reason={reason} portfolio=${value:.2f}")
+                  f"action={action} reason={reason} portfolio=${value:.2f}")
 
         except Exception as e:
-            print(f"[{timestamp}] Error processing {symbol}: {e}")
+            print(f"[{timestamp}] ERROR processing {symbol}: {e}")
 
     save_state(state)
 
 
 if __name__ == "__main__":
     main()
+'''
+
+with open('/mnt/agents/output/crypto_paper_trading_agent_v3_1_fixed.py', 'w') as f:
+    f.write(code)
+
+print("File saved successfully!")
