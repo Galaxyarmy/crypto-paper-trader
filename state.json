@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 6,
   "coins": {
     "BTCUSDT": {
       "cash": 5000.0,
@@ -8,7 +8,13 @@
       "entry_price": null,
       "day": "2026-08-22",
       "day_start_value": 5000.0,
-      "day_halted": false
+      "day_halted": false,
+      "win_trades": 0,
+      "loss_trades": 0,
+      "partial_sold": false,
+      "partial_qty": 0.0,
+      "peak_value": 5000.0,
+      "max_drawdown": 0.0
     },
     "ETHUSDT": {
       "cash": 4984.4589067131,
@@ -17,7 +23,13 @@
       "entry_price": null,
       "day": "2026-08-22",
       "day_start_value": 4984.4589067131,
-      "day_halted": false
+      "day_halted": false,
+      "win_trades": 0,
+      "loss_trades": 0,
+      "partial_sold": false,
+      "partial_qty": 0.0,
+      "peak_value": 5000.0,
+      "max_drawdown": 0.0031082186573799845
     }
   }
 }
