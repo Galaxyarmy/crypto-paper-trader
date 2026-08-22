@@ -38,7 +38,7 @@ import pandas as pd
 # ------------------------- CONFIG -------------------------
 
 COINS = ["BTCUSDT", "ETHUSDT"]
-INTERVAL = "5m"
+INTERVAL = "15m"
 STARTING_CASH_PER_COIN = 5000.0
 FEE_PCT = 0.001
 
