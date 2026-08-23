@@ -8,9 +8,17 @@ on:
 permissions:
   contents: write
 
+# Prevents overlapping runs — if a run is still going when the next
+# scheduled trigger fires, the new one waits instead of running in
+# parallel (which is what caused the push conflict).
+concurrency:
+  group: trading-agent
+  cancel-in-progress: false
+
 jobs:
   run-agent:
     runs-on: ubuntu-latest
+    timeout-minutes: 10   # safety net: kill the job if it ever hangs again
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -32,4 +40,7 @@ jobs:
           git config user.email "trading-bot@users.noreply.github.com"
           git add state.json trade_log_v6.csv
           git diff --quiet --cached || git commit -m "Update paper trading state [skip ci]"
+          # Pull any changes that landed between our checkout and now,
+          # then push. If nothing changed, this is a no-op.
+          git pull --rebase origin main
           git push
