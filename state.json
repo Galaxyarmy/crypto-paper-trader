@@ -17,19 +17,19 @@
       "max_drawdown": 0.0
     },
     "ETHUSDT": {
-      "cash": 4070.2662562793817,
-      "coin_qty": 0.38137799067182615,
-      "num_trades": 4,
-      "entry_price": 2448.1,
+      "cash": 5013.899616737431,
+      "coin_qty": 0.0,
+      "num_trades": 5,
+      "entry_price": null,
       "day": "2026-08-24",
       "day_start_value": 4984.4589067131,
       "day_halted": false,
-      "win_trades": 0,
+      "win_trades": 1,
       "loss_trades": 0,
-      "partial_sold": true,
-      "partial_qty": 0.38137799067182615,
+      "partial_sold": false,
+      "partial_qty": 0.0,
       "peak_value": 5033.375351242571,
-      "max_drawdown": 0.0034820530753833737
+      "max_drawdown": 0.003869318925387191
     }
   }
 }
