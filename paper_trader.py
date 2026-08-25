@@ -42,11 +42,11 @@ STOP_LOSS_PCT = 0.02
 TRAILING_STOP_PCT = 0.015
 PARTIAL_PROFIT_PCT = 0.015
 POSITION_SIZE_PCT = 0.5
-MIN_MOVE_PCT = 0.004
+MIN_MOVE_PCT = 0.0025
 MAX_DAILY_LOSS_PCT = 0.03
 MIN_RISK_REWARD = 1.5
 
-ADX_MIN = 25.0
+ADX_MIN = 20.0
 OB_IMBALANCE_THRESHOLD = 0.10
 FUNDING_EXTREME = 0.0005
 FEAR_GREED_FEAR = 25
@@ -552,31 +552,4 @@ def main():
             if dd > wallet.get("max_drawdown", 0):
                 wallet["max_drawdown"] = dd
 
-            day_loss = (wallet["day_start_value"] - value) / wallet["day_start_value"]
-            if day_loss >= MAX_DAILY_LOSS_PCT:
-                wallet["day_halted"] = True
-
-            latest = df_15m.iloc[-1]
-            log_row([
-                timestamp, symbol, action, base_signal, reason, price, trade_qty,
-                wallet["cash"], wallet["coin_qty"], value,
-                round(latest["ema_short"], 2), round(latest["ema_long"], 2),
-                round(latest["rsi"], 2), round(adx, 2), round(atr, 2),
-                round(funding, 6), fg["value"], round(ob["imbalance"], 3), round(size_mult, 2)
-            ])
-
-            total = wallet["num_trades"]
-            wins = wallet.get("win_trades", 0)
-            wr = (wins / total * 100) if total > 0 else 0
-            print(f"  >> Action={action} | Value=${value:,.2f} | WinRate={wr:.1f}%")
-
-        except Exception as e:
-            print(f"[ERROR] Critical failure processing {symbol}: {e}")
-
-    save_state(state)
-    elapsed = time.time() - start
-    print(f"\n[DONE] Execution completed in {elapsed:.2f}s")
-
-
-if __name__ == "__main__":
-    main()
+            day_loss = (wallet["day_start_value"] - value) / wallet["day_start_value
