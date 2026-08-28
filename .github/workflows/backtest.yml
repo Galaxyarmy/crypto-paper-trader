@@ -2,7 +2,8 @@ name: Run Backtest
 
 on:
   workflow_dispatch:   # manual trigger button — tap "Run workflow" from GitHub mobile app
-
+permissions:
+  contents: write
 jobs:
   backtest:
     runs-on: ubuntu-latest
