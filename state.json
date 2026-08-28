@@ -1,5 +1,5 @@
 {
-  "schema_version": 6,
+  "schema_version": 6.2,
   "coins": {
     "BTCUSDT": {
       "cash": 5000.0,
@@ -14,7 +14,8 @@
       "partial_sold": false,
       "partial_qty": 0.0,
       "peak_value": 5000.0,
-      "max_drawdown": 0.0
+      "max_drawdown": 0.0,
+      "peak_price": null
     },
     "ETHUSDT": {
       "cash": 5013.899616737431,
@@ -29,7 +30,8 @@
       "partial_sold": false,
       "partial_qty": 0.0,
       "peak_value": 5033.375351242571,
-      "max_drawdown": 0.003869318925387191
+      "max_drawdown": 0.003869318925387191,
+      "peak_price": null
     }
   }
 }
