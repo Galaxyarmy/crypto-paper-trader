@@ -1,0 +1,28 @@
+name: Run Backtest
+
+on:
+  workflow_dispatch:   # manual trigger button — tap "Run workflow" from GitHub mobile app
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests pandas numpy
+
+      - name: Run backtest
+        run: python backtest.py
+
+      - name: Commit results back to repo
+        run: |
+          git config user.name "backtest-bot"
+          git config user.email "backtest-bot@users.noreply.github.com"
+          git add backtest_trades.csv backtest_summary.md
+          git diff --staged --quiet || git commit -m "Backtest results $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git push
