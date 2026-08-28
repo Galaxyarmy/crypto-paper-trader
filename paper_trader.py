@@ -1,11 +1,13 @@
 """
-Crypto Paper Trading Agent v6.1 — Robust Production Edition
+Crypto Paper Trading Agent v6.2 — Trailing Stop Fixed + Cleaner Edition
 
-Improvements vs v6:
-1. Centralized HTTP Session with Automatic Retries (Exponential Backoff for 429/5xx errors).
-2. Fail-safe Wrappers on ALL API endpoints (fetch_klines, order_book, funding_rate, fear_greed).
-3. ThreadPool exception handling to prevent worker crashes during parallel calls.
-4. Preserved all core strategies (ADX, 1H Filter, OB Imbalance, Trailing Stops, Win/Loss fixes).
+Changes vs v6.1:
+1. CRITICAL FIX: Proper Peak-Price based Trailing Stop (was completely broken).
+2. peak_price tracking added in state.
+3. Partial sell ke baad remaining position pe trailing continue hota hai.
+4. Entry/Exit pe peak_price correctly set/reset.
+5. Code thoda cleaner + comments for future Futures version.
+6. Win/Loss counting thoda more accurate.
 
 Requirements: pip install requests pandas
 """
@@ -18,7 +20,6 @@ from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
-
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import pandas as pd
@@ -59,7 +60,7 @@ BINANCE_SPOT = "https://data-api.binance.vision/api/v3"
 BINANCE_FUTURES = "https://fapi.binance.com/fapi/v1"
 FEAR_GREED_URL = "https://api.alternative.me/fng/?limit=1"
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 6.2
 
 # -------------------- HTTP SESSION SETUP --------------------
 
@@ -93,6 +94,7 @@ def default_state() -> dict:
                 "win_trades": 0,
                 "loss_trades": 0,
                 "entry_price": None,
+                "peak_price": None,          # ← NEW: Trailing ke liye
                 "partial_sold": False,
                 "partial_qty": 0.0,
                 "day": today,
@@ -126,7 +128,7 @@ def load_state() -> dict:
         new_state["coins"] = migrated
         state = new_state
         if has_old:
-            print("[INFO] Migrated old state -> v6.")
+            print("[INFO] Migrated old state -> v6.2")
     else:
         defaults = default_state()
         for sym in COINS:
@@ -144,7 +146,7 @@ def save_state(state: dict):
         json.dump(state, f, indent=2)
 
 
-# -------------------- DATA FETCHERS (WITH RETRIES) --------------------
+# -------------------- DATA FETCHERS --------------------
 
 def fetch_klines(symbol: str, interval: str, limit: int = 150) -> pd.DataFrame:
     params = {"symbol": symbol, "interval": interval, "limit": limit}
@@ -358,28 +360,40 @@ def calculate_position(wallet: dict, price: float, atr: float, size_mult: float)
 
 
 def check_exits(wallet: dict, price: float, atr: float, final_signal: str) -> tuple:
+    """
+    Proper Peak-Price based Trailing Stop + Partial + Hard Stop
+    """
     if wallet["coin_qty"] <= 0 or wallet.get("entry_price") is None:
         return "HOLD", "", 0.0
 
     entry = wallet["entry_price"]
     current_qty = wallet["coin_qty"]
 
+    # 1. Hard Stop Loss
     stop_dist = max(atr * 2, entry * STOP_LOSS_PCT) if not pd.isna(atr) else entry * STOP_LOSS_PCT
     hard_stop = entry - stop_dist
     if price <= hard_stop:
         return "SELL", f"STOP_LOSS|hard@{hard_stop:.0f}", current_qty
 
+    # 2. Update Peak Price (highest price since entry)
+    if wallet.get("peak_price") is None or price > wallet["peak_price"]:
+        wallet["peak_price"] = price
+
+    # 3. Partial Profit (only once)
     if not wallet.get("partial_sold", False):
         partial_target = entry * (1 + PARTIAL_PROFIT_PCT)
         if price >= partial_target:
             partial_qty = current_qty * 0.5
             return "PARTIAL", f"PARTIAL_PROFIT|+{PARTIAL_PROFIT_PCT:.1%}", partial_qty
 
-    if price > entry * 1.03:
-        trail_stop = price * (1 - TRAILING_STOP_PCT)
+    # 4. Trailing Stop (from peak)
+    # Activate only after we have made at least partial profit level
+    if wallet["peak_price"] is not None and wallet["peak_price"] >= entry * (1 + PARTIAL_PROFIT_PCT):
+        trail_stop = wallet["peak_price"] * (1 - TRAILING_STOP_PCT)
         if price <= trail_stop:
-            return "SELL", f"TRAILING_STOP|trail@{trail_stop:.0f}", current_qty
+            return "SELL", f"TRAILING_STOP|peak={wallet['peak_price']:.0f}|trail@{trail_stop:.0f}", current_qty
 
+    # 5. Signal based exit
     if final_signal == "SELL":
         return "SELL", "SELL_SIGNAL", current_qty
 
@@ -456,7 +470,7 @@ def main():
                     print(f"[WARN] OrderBook execution error: {e}")
                     ob = {"imbalance": 0.0, "bid_vol": 0.0, "ask_vol": 0.0}
 
-            print(f"  Price=${price:,.2f} | ADX={adx:.1f} | ATR=${atr:,.2f} | "
+            print(f"  Price=\( {price:,.2f} | ADX={adx:.1f} | ATR= \){atr:,.2f} | "
                   f"Funding={funding:.4%} | OB={ob['imbalance']:+.2f}")
 
             final_signal, filter_reason, size_mult = apply_filters(
@@ -467,8 +481,10 @@ def main():
             wallet = state["coins"][symbol]
             reset_day_if_needed(wallet, price)
 
+            # Safety: agar position hai lekin entry_price missing hai
             if wallet["coin_qty"] > 0 and wallet.get("entry_price") is None:
                 wallet["entry_price"] = price
+                wallet["peak_price"] = price
                 wallet["partial_sold"] = False
                 wallet["partial_qty"] = 0.0
 
@@ -476,9 +492,10 @@ def main():
             reason = filter_reason
             trade_qty = 0.0
 
-            # --- EXIT LOGIC ---
+            # ========== EXIT LOGIC ==========
             if wallet["coin_qty"] > 0:
                 exit_action, exit_reason, exit_qty = check_exits(wallet, price, atr, final_signal)
+
                 if exit_action == "SELL":
                     entry_price_at_exit = wallet.get("entry_price")
 
@@ -486,18 +503,24 @@ def main():
                     fee = proceeds * FEE_PCT
                     wallet["cash"] += proceeds - fee
                     wallet["coin_qty"] -= exit_qty
+
                     if wallet["coin_qty"] <= 1e-9:
                         wallet["coin_qty"] = 0.0
                         wallet["entry_price"] = None
+                        wallet["peak_price"] = None
                         wallet["partial_sold"] = False
                         wallet["partial_qty"] = 0.0
+
                     wallet["num_trades"] += 1
                     trade_qty = exit_qty
 
-                    if entry_price_at_exit is not None and price > entry_price_at_exit:
-                        wallet["win_trades"] = wallet.get("win_trades", 0) + 1
-                    else:
-                        wallet["loss_trades"] = wallet.get("loss_trades", 0) + 1
+                    # Win/Loss
+                    if entry_price_at_exit is not None:
+                        if price > entry_price_at_exit:
+                            wallet["win_trades"] = wallet.get("win_trades", 0) + 1
+                        else:
+                            wallet["loss_trades"] = wallet.get("loss_trades", 0) + 1
+
                     action = "SELL"
                     reason = exit_reason
 
@@ -508,6 +531,7 @@ def main():
                     wallet["coin_qty"] -= exit_qty
                     wallet["partial_sold"] = True
                     wallet["partial_qty"] = exit_qty
+                    # peak_price ko mat todo — remaining position pe trailing continue karega
                     wallet["num_trades"] += 1
                     trade_qty = exit_qty
                     action = "PARTIAL"
@@ -517,7 +541,7 @@ def main():
                     action = "HOLD"
                     reason = "DAILY_LOSS_HALT"
 
-            # --- ENTRY LOGIC ---
+            # ========== ENTRY LOGIC ==========
             elif wallet["day_halted"]:
                 action = "HOLD"
                 reason = "DAILY_LOSS_HALT"
@@ -538,6 +562,7 @@ def main():
                         wallet["coin_qty"] += qty
                         wallet["cash"] -= spend
                         wallet["entry_price"] = price
+                        wallet["peak_price"] = price          # ← IMPORTANT
                         wallet["partial_sold"] = False
                         wallet["partial_qty"] = 0.0
                         wallet["num_trades"] += 1
@@ -545,6 +570,7 @@ def main():
                         action = "BUY"
                         reason = f"BUY|{filter_reason}|size={size_mult:.0%}"
 
+            # ========== Portfolio tracking ==========
             value = wallet["cash"] + wallet["coin_qty"] * price
             if value > wallet.get("peak_value", value):
                 wallet["peak_value"] = value
@@ -552,7 +578,7 @@ def main():
             if dd > wallet.get("max_drawdown", 0):
                 wallet["max_drawdown"] = dd
 
-            day_loss = (wallet["day_start_value"] - value) / wallet["day_start_value"]
+            day_loss = (wallet["day_start_value"] - value) / wallet["day_start_value"] if wallet["day_start_value"] > 0 else 0
             if day_loss >= MAX_DAILY_LOSS_PCT:
                 wallet["day_halted"] = True
 
@@ -568,7 +594,7 @@ def main():
             total = wallet["num_trades"]
             wins = wallet.get("win_trades", 0)
             wr = (wins / total * 100) if total > 0 else 0
-            print(f"  >> Action={action} | Value=${value:,.2f} | WinRate={wr:.1f}%")
+            print(f"  >> Action={action} | Value=${value:,.2f} | WinRate={wr:.1f}% | Peak={wallet.get('peak_price')}")
 
         except Exception as e:
             print(f"[ERROR] Critical failure processing {symbol}: {e}")
