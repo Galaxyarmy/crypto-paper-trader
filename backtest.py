@@ -26,6 +26,7 @@ PRIMARY_INTERVAL = "15m"
 TREND_INTERVAL = "1h"
 
 BACKTEST_DAYS = 90
+BACKTEST_OFFSET_DAYS = 90   # NEW: kitne din pehle se test start ho
 
 STARTING_CASH_PER_COIN = 5000.0
 FEE_PCT = 0.001
@@ -464,7 +465,7 @@ def backtest_symbol(symbol, df_15m, df_1h, funding_df, fg_df):
 
 def main():
     print("Starting Backtest v6.2 (Peak Trailing Stop)...")
-    end = datetime.now(timezone.utc)
+    end = datetime.now(timezone.utc) - timedelta(days=BACKTEST_OFFSET_DAYS)
     start = end - timedelta(days=BACKTEST_DAYS)
     start_ms = int(start.timestamp() * 1000)
     end_ms = int(end.timestamp() * 1000)
