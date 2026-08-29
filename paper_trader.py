@@ -545,8 +545,7 @@ def main():
             # ========== EXIT LOGIC ==========
             if wallet["coin_qty"] > 0:
                 exit_action, exit_reason, exit_qty = check_exits(wallet, price, atr, final_signal)
-
-                if exit_action == "SELL":
+                if exit_action in ("SELL", "COVER"):
                     entry_price_at_exit = wallet.get("entry_price")
 
                     proceeds = exit_qty * price
@@ -558,6 +557,8 @@ def main():
                         wallet["coin_qty"] = 0.0
                         wallet["entry_price"] = None
                         wallet["peak_price"] = None
+                        wallet["trough_price"] = None
+                        wallet["position_type"] = None
                         wallet["partial_sold"] = False
                         wallet["partial_qty"] = 0.0
 
@@ -566,12 +567,14 @@ def main():
 
                     # Win/Loss
                     if entry_price_at_exit is not None:
-                        if price > entry_price_at_exit:
+                        was_short = wallet.get("position_type") == "SHORT"
+                        won = (price < entry_price_at_exit) if was_short else (price > entry_price_at_exit)
+                        if won:
                             wallet["win_trades"] = wallet.get("win_trades", 0) + 1
                         else:
                             wallet["loss_trades"] = wallet.get("loss_trades", 0) + 1
 
-                    action = "SELL"
+                    action = exit_action
                     reason = exit_reason
 
                 elif exit_action == "PARTIAL":
@@ -581,7 +584,7 @@ def main():
                     wallet["coin_qty"] -= exit_qty
                     wallet["partial_sold"] = True
                     wallet["partial_qty"] = exit_qty
-                    # peak_price ko mat todo — remaining position pe trailing continue karega
+                    # peak_price/trough_price ko mat todo — remaining position pe trailing continue karega
                     wallet["num_trades"] += 1
                     trade_qty = exit_qty
                     action = "PARTIAL"
@@ -612,13 +615,39 @@ def main():
                         wallet["coin_qty"] += qty
                         wallet["cash"] -= spend
                         wallet["entry_price"] = price
-                        wallet["peak_price"] = price          # ← IMPORTANT
+                        wallet["peak_price"] = price
+                        wallet["position_type"] = "LONG"
                         wallet["partial_sold"] = False
                         wallet["partial_qty"] = 0.0
                         wallet["num_trades"] += 1
                         trade_qty = qty
                         action = "BUY"
                         reason = f"BUY|{filter_reason}|size={size_mult:.0%}"
+
+            elif final_signal == "SHORT" and wallet["cash"] > 0:
+                if move < MIN_MOVE_PCT:
+                    action = "HOLD"
+                    reason = "SKIP_SMALL_MOVE"
+                elif size_mult <= 0:
+                    action = "HOLD"
+                    reason = filter_reason
+                else:
+                    qty, spend = calculate_position(wallet, price, atr, size_mult)
+                    if qty <= 0:
+                        action = "HOLD"
+                        reason = "RISK_SIZING_FAIL"
+                    else:
+                        wallet["coin_qty"] += qty
+                        wallet["cash"] += spend
+                        wallet["entry_price"] = price
+                        wallet["trough_price"] = price
+                        wallet["position_type"] = "SHORT"
+                        wallet["partial_sold"] = False
+                        wallet["partial_qty"] = 0.0
+                        wallet["num_trades"] += 1
+                        trade_qty = qty
+                        action = "SHORT"
+                        reason = f"SHORT|{filter_reason}|size={size_mult:.0%}"
 
             # ========== Portfolio tracking ==========
             value = wallet["cash"] + wallet["coin_qty"] * price
