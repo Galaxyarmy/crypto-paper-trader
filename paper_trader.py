@@ -254,9 +254,12 @@ def generate_signal(df: pd.DataFrame) -> str:
     latest = df.iloc[-1]
     crossed_up = prev["ema_short"] <= prev["ema_long"] and latest["ema_short"] > latest["ema_long"]
     crossed_down = prev["ema_short"] >= prev["ema_long"] and latest["ema_short"] < latest["ema_long"]
+
     if crossed_up and latest["rsi"] < RSI_OVERBOUGHT:
         return "BUY"
-    if crossed_down or latest["rsi"] > RSI_OVERBOUGHT:
+    if crossed_down:
+        return "SHORT"
+    if latest["rsi"] > RSI_OVERBOUGHT:
         return "SELL"
     return "HOLD"
 
@@ -272,26 +275,27 @@ def recent_move_pct(df: pd.DataFrame, lookback: int = 5) -> float:
 # -------------------- FILTER ENGINE --------------------
 
 def apply_filters(symbol: str, base_signal: str,
-                  primary_df: pd.DataFrame, trend_df: pd.DataFrame,
-                  funding: float, fg: dict, ob: dict) -> tuple:
+                   primary_df: pd.DataFrame, trend_df: pd.DataFrame,
+                   funding: float, fg: dict, ob: dict) -> tuple:
     reasons = []
     size_mult = 1.0
-
     latest = primary_df.iloc[-1]
     price = latest["close"]
     adx = latest["adx"]
     atr = latest["atr"]
 
+    is_entry_signal = base_signal in ("BUY", "SHORT")
+
     if pd.isna(adx) or adx < ADX_MIN:
         reasons.append(f"ADX_WEAK({adx:.1f})" if not pd.isna(adx) else "ADX_WEAK(nan)")
-        if base_signal == "BUY":
+        if is_entry_signal:
             return "HOLD", "FILTER:" + ",".join(reasons), 0
     else:
         reasons.append(f"ADX_OK({adx:.1f})")
         ema_sep = abs(latest["ema_short"] - latest["ema_long"]) / price
         if ema_sep < EMA_SEP_MIN_PCT:
             reasons.append(f"EMA_FLAT(sep={ema_sep:.4%})")
-            if base_signal == "BUY":
+            if is_entry_signal:
                 return "HOLD", "FILTER:" + ",".join(reasons), 0
         else:
             reasons.append(f"EMA_SEP_OK({ema_sep:.4%})")
@@ -299,12 +303,23 @@ def apply_filters(symbol: str, base_signal: str,
     if len(trend_df) > TREND_EMA:
         trend_price = float(trend_df.iloc[-1]["close"])
         trend_ema = float(trend_df.iloc[-1]["ema_trend"])
+
         if base_signal == "BUY" and trend_price < trend_ema:
             reasons.append(f"1H_BELOW_EMA50({trend_price:.0f}<{trend_ema:.0f})")
             return "HOLD", "FILTER:" + ",".join(reasons), 0
         if base_signal == "BUY" and trend_price > trend_ema:
             reasons.append("1H_ABOVE_EMA50")
             size_mult = min(size_mult + 0.25, 1.5)
+
+        if base_signal == "SHORT" and trend_price > trend_ema:
+            reasons.append(f"1H_ABOVE_EMA50({trend_price:.0f}>{trend_ema:.0f})")
+            return "HOLD", "FILTER:" + ",".join(reasons), 0
+        if base_signal == "SHORT" and trend_price < trend_ema:
+            reasons.append("1H_BELOW_EMA50")
+            size_mult = min(size_mult + 0.25, 1.5)
+
+    if base_signal == "SHORT":
+        return base_signal, "FILTER_OK:" + ",".join(reasons), size_mult
 
     ob_imb = ob.get("imbalance", 0)
     if abs(ob_imb) > OB_IMBALANCE_THRESHOLD:
@@ -346,7 +361,6 @@ def apply_filters(symbol: str, base_signal: str,
 
     return base_signal, "FILTER_OK:" + ",".join(reasons), size_mult
 
-
 # -------------------- POSITION & EXIT LOGIC --------------------
 
 def calculate_position(wallet: dict, price: float, atr: float, size_mult: float) -> tuple:
@@ -371,41 +385,67 @@ def calculate_position(wallet: dict, price: float, atr: float, size_mult: float)
 
 def check_exits(wallet: dict, price: float, atr: float, final_signal: str) -> tuple:
     """
-    Proper Peak-Price based Trailing Stop + Partial + Hard Stop
+    Proper Peak/Trough-Price based Trailing Stop + Partial + Hard Stop
+    Handles both LONG and SHORT positions.
     """
     if wallet["coin_qty"] <= 0 or wallet.get("entry_price") is None:
         return "HOLD", "", 0.0
 
     entry = wallet["entry_price"]
     current_qty = wallet["coin_qty"]
+    pos_type = wallet.get("position_type", "LONG")
 
-    # 1. Hard Stop Loss
-    stop_dist = max(atr * 2, entry * STOP_LOSS_PCT) if not pd.isna(atr) else entry * STOP_LOSS_PCT
-    hard_stop = entry - stop_dist
-    if price <= hard_stop:
-        return "SELL", f"STOP_LOSS|hard@{hard_stop:.0f}", current_qty
+    # ========== LONG POSITION ==========
+    if pos_type == "LONG":
+        stop_dist = max(atr * 2, entry * STOP_LOSS_PCT) if not pd.isna(atr) else entry * STOP_LOSS_PCT
+        hard_stop = entry - stop_dist
+        if price <= hard_stop:
+            return "SELL", f"STOP_LOSS|hard@{hard_stop:.0f}", current_qty
 
-    # 2. Update Peak Price (highest price since entry)
-    if wallet.get("peak_price") is None or price > wallet["peak_price"]:
-        wallet["peak_price"] = price
+        if wallet.get("peak_price") is None or price > wallet["peak_price"]:
+            wallet["peak_price"] = price
 
-    # 3. Partial Profit (only once)
-    if not wallet.get("partial_sold", False):
-        partial_target = entry * (1 + PARTIAL_PROFIT_PCT)
-        if price >= partial_target:
-            partial_qty = current_qty * 0.5
-            return "PARTIAL", f"PARTIAL_PROFIT|+{PARTIAL_PROFIT_PCT:.1%}", partial_qty
+        if not wallet.get("partial_sold", False):
+            partial_target = entry * (1 + PARTIAL_PROFIT_PCT)
+            if price >= partial_target:
+                partial_qty = current_qty * 0.5
+                return "PARTIAL", f"PARTIAL_PROFIT|+{PARTIAL_PROFIT_PCT:.1%}", partial_qty
 
-    # 4. Trailing Stop (from peak)
-    # Activate only after we have made at least partial profit level
-    if wallet["peak_price"] is not None and wallet["peak_price"] >= entry * (1 + PARTIAL_PROFIT_PCT):
-        trail_stop = wallet["peak_price"] * (1 - TRAILING_STOP_PCT)
-        if price <= trail_stop:
-            return "SELL", f"TRAILING_STOP|peak={wallet['peak_price']:.0f}|trail@{trail_stop:.0f}", current_qty
+        if wallet["peak_price"] is not None and wallet["peak_price"] >= entry * (1 + PARTIAL_PROFIT_PCT):
+            trail_stop = wallet["peak_price"] * (1 - TRAILING_STOP_PCT)
+            if price <= trail_stop:
+                return "SELL", f"TRAILING_STOP|peak={wallet['peak_price']:.0f}|trail@{trail_stop:.0f}", current_qty
 
-    # 5. Signal based exit
-    if final_signal == "SELL":
-        return "SELL", "SELL_SIGNAL", current_qty
+        if final_signal in ("SELL", "SHORT"):
+            return "SELL", "SELL_SIGNAL", current_qty
+
+        return "HOLD", "", 0.0
+
+    # ========== SHORT POSITION ==========
+    elif pos_type == "SHORT":
+        stop_dist = max(atr * 2, entry * STOP_LOSS_PCT) if not pd.isna(atr) else entry * STOP_LOSS_PCT
+        hard_stop = entry + stop_dist
+        if price >= hard_stop:
+            return "COVER", f"STOP_LOSS|hard@{hard_stop:.0f}", current_qty
+
+        if wallet.get("trough_price") is None or price < wallet["trough_price"]:
+            wallet["trough_price"] = price
+
+        if not wallet.get("partial_sold", False):
+            partial_target = entry * (1 - PARTIAL_PROFIT_PCT)
+            if price <= partial_target:
+                partial_qty = current_qty * 0.5
+                return "PARTIAL", f"PARTIAL_PROFIT|+{PARTIAL_PROFIT_PCT:.1%}", partial_qty
+
+        if wallet["trough_price"] is not None and wallet["trough_price"] <= entry * (1 - PARTIAL_PROFIT_PCT):
+            trail_stop = wallet["trough_price"] * (1 + TRAILING_STOP_PCT)
+            if price >= trail_stop:
+                return "COVER", f"TRAILING_STOP|trough={wallet['trough_price']:.0f}|trail@{trail_stop:.0f}", current_qty
+
+        if final_signal == "BUY":
+            return "COVER", "COVER_SIGNAL", current_qty
+
+        return "HOLD", "", 0.0
 
     return "HOLD", "", 0.0
 
