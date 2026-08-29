@@ -4,15 +4,15 @@ Period: 2026-05-31 to 2026-08-29 (90 days)
 
 ## BTCUSDT
 
-- Start: $5,000.00 → End: $4,750.53 (-4.99%)
-- Total trades: 48
-- Win rate: 34.8% (8W / 15L)
-- Max drawdown: 6.91%
+- Start: $5,000.00 → End: $4,885.54 (-2.29%)
+- Total trades: 23
+- Win rate: 36.4% (4W / 7L)
+- Max drawdown: 3.86%
 
 ## ETHUSDT
 
-- Start: $5,000.00 → End: $4,767.43 (-4.65%)
-- Total trades: 93
-- Win rate: 37.2% (16W / 27L)
-- Max drawdown: 7.23%
+- Start: $5,000.00 → End: $4,871.98 (-2.56%)
+- Total trades: 22
+- Win rate: 45.5% (5W / 6L)
+- Max drawdown: 2.83%
 
