@@ -550,7 +550,7 @@ def main():
 
                     proceeds = exit_qty * price
                     fee = proceeds * FEE_PCT
-                    wallet["cash"] += proceeds - fee
+                    wallet["cash"] += proceeds - fee if exit_action != "COVER" else -(proceeds + fee)
                     wallet["coin_qty"] -= exit_qty
 
                     if wallet["coin_qty"] <= 1e-9:
@@ -580,7 +580,7 @@ def main():
                 elif exit_action == "PARTIAL":
                     proceeds = exit_qty * price
                     fee = proceeds * FEE_PCT
-                    wallet["cash"] += proceeds - fee
+                    wallet["cash"] += proceeds - fee if wallet.get("position_type") != "SHORT" else -(proceeds + fee)
                     wallet["coin_qty"] -= exit_qty
                     wallet["partial_sold"] = True
                     wallet["partial_qty"] = exit_qty
