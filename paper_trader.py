@@ -96,6 +96,8 @@ def default_state() -> dict:
                 "loss_trades": 0,
                 "entry_price": None,
                 "peak_price": None,          # ← NEW: Trailing ke liye
+                "trough_price": None,     # NEW: SHORT ke liye
+                "position_type": None,    # NEW: "LONG", "SHORT", ya None
                 "partial_sold": False,
                 "partial_qty": 0.0,
                 "day": today,
