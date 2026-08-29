@@ -26,7 +26,7 @@ PRIMARY_INTERVAL = "15m"
 TREND_INTERVAL = "1h"
 
 BACKTEST_DAYS = 90
-BACKTEST_OFFSET_DAYS = 90   # NEW: kitne din pehle se test start ho
+BACKTEST_OFFSET_DAYS = 0   # NEW: kitne din pehle se test start ho
 
 STARTING_CASH_PER_COIN = 5000.0
 FEE_PCT = 0.001
