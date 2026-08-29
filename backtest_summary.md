@@ -1,18 +1,18 @@
 # Backtest Summary — v6.2 (Peak Trailing Stop)
 
-Period: 2026-05-31 to 2026-08-29 (90 days)
+Period: 2026-03-02 to 2026-05-31 (90 days)
 
 ## BTCUSDT
 
-- Start: $5,000.00 → End: $4,957.13 (-0.86%)
-- Total trades: 4
-- Win rate: 50.0% (1W / 1L)
-- Max drawdown: 1.03%
+- Start: $5,000.00 → End: $4,890.39 (-2.19%)
+- Total trades: 25
+- Win rate: 50.0% (6W / 6L)
+- Max drawdown: 3.28%
 
 ## ETHUSDT
 
-- Start: $5,000.00 → End: $4,899.07 (-2.02%)
-- Total trades: 8
-- Win rate: 50.0% (2W / 2L)
-- Max drawdown: 2.16%
+- Start: $5,000.00 → End: $4,760.35 (-4.79%)
+- Total trades: 25
+- Win rate: 33.3% (4W / 8L)
+- Max drawdown: 5.76%
 
