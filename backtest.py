@@ -45,6 +45,7 @@ MAX_DAILY_LOSS_PCT = 0.03
 MIN_RISK_REWARD = 1.5
 
 ADX_MIN = 20.0
+EMA_SEP_MIN_PCT = 0.0015
 FUNDING_EXTREME = 0.0005
 FEAR_GREED_FEAR = 25
 FEAR_GREED_GREED = 75
@@ -199,6 +200,10 @@ def apply_filters(base_signal, latest, trend_price, trend_ema, funding, fg_value
 
     if pd.isna(adx) or adx < ADX_MIN:
         if base_signal == "BUY":
+            return "HOLD", 0.0
+    else:
+        ema_sep = abs(latest["ema_short"] - latest["ema_long"]) / price
+        if ema_sep < EMA_SEP_MIN_PCT and base_signal == "BUY":
             return "HOLD", 0.0
 
     if not pd.isna(trend_ema):
