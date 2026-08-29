@@ -184,12 +184,14 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 def generate_signal(prev_row, latest_row) -> str:
     crossed_up = prev_row["ema_short"] <= prev_row["ema_long"] and latest_row["ema_short"] > latest_row["ema_long"]
     crossed_down = prev_row["ema_short"] >= prev_row["ema_long"] and latest_row["ema_short"] < latest_row["ema_long"]
+
     if crossed_up and latest_row["rsi"] < RSI_OVERBOUGHT:
         return "BUY"
-    if crossed_down or latest_row["rsi"] > RSI_OVERBOUGHT:
+    if crossed_down:
+        return "SHORT"
+    if latest_row["rsi"] > RSI_OVERBOUGHT:
         return "SELL"
     return "HOLD"
-
 
 # ------------------------- FILTER ENGINE -------------------------
 
@@ -199,12 +201,14 @@ def apply_filters(base_signal, latest, trend_price, trend_ema, funding, fg_value
     price = latest["close"]
     atr = latest["atr"]
 
+    is_entry_signal = base_signal in ("BUY", "SHORT")
+
     if pd.isna(adx) or adx < ADX_MIN:
-        if base_signal == "BUY":
+        if is_entry_signal:
             return "HOLD", 0.0
     else:
         ema_sep = abs(latest["ema_short"] - latest["ema_long"]) / price
-        if ema_sep < EMA_SEP_MIN_PCT and base_signal == "BUY":
+        if ema_sep < EMA_SEP_MIN_PCT and is_entry_signal:
             return "HOLD", 0.0
 
     if not pd.isna(trend_ema):
@@ -212,6 +216,14 @@ def apply_filters(base_signal, latest, trend_price, trend_ema, funding, fg_value
             return "HOLD", 0.0
         if base_signal == "BUY" and trend_price > trend_ema:
             size_mult = min(size_mult + 0.25, 1.5)
+
+        if base_signal == "SHORT" and trend_price > trend_ema:
+            return "HOLD", 0.0
+        if base_signal == "SHORT" and trend_price < trend_ema:
+            size_mult = min(size_mult + 0.25, 1.5)
+
+    if base_signal == "SHORT":
+        return base_signal, size_mult
 
     if funding > FUNDING_EXTREME and base_signal == "BUY":
         return "HOLD", 0.0
@@ -224,7 +236,6 @@ def apply_filters(base_signal, latest, trend_price, trend_ema, funding, fg_value
         return "HOLD", 0.0
 
     return base_signal, size_mult
-
 
 def calculate_position(wallet, price, atr, size_mult):
     portfolio = wallet["cash"] + wallet["coin_qty"] * price
@@ -246,39 +257,61 @@ def calculate_position(wallet, price, atr, size_mult):
 
 
 def check_exits(wallet, price, atr, final_signal):
-    """Proper Peak-Price based Trailing Stop"""
+    """Proper Peak/Trough-Price based Trailing Stop. Handles LONG and SHORT."""
     if wallet["coin_qty"] <= 0 or wallet.get("entry_price") is None:
         return "HOLD", "", 0.0
 
     entry = wallet["entry_price"]
     qty = wallet["coin_qty"]
+    pos_type = wallet.get("position_type", "LONG")
 
-    # Hard Stop
-    stop_dist = max(atr * 2, entry * STOP_LOSS_PCT) if not pd.isna(atr) else entry * STOP_LOSS_PCT
-    hard_stop = entry - stop_dist
-    if price <= hard_stop:
-        return "SELL", "STOP_LOSS", qty
+    if pos_type == "LONG":
+        stop_dist = max(atr * 2, entry * STOP_LOSS_PCT) if not pd.isna(atr) else entry * STOP_LOSS_PCT
+        hard_stop = entry - stop_dist
+        if price <= hard_stop:
+            return "SELL", "STOP_LOSS", qty
 
-    # Update Peak
-    if wallet.get("peak_price") is None or price > wallet["peak_price"]:
-        wallet["peak_price"] = price
+        if wallet.get("peak_price") is None or price > wallet["peak_price"]:
+            wallet["peak_price"] = price
 
-    # Partial Profit
-    if not wallet.get("partial_sold", False):
-        if price >= entry * (1 + PARTIAL_PROFIT_PCT):
-            return "PARTIAL", "PARTIAL_PROFIT", qty * 0.5
+        if not wallet.get("partial_sold", False):
+            if price >= entry * (1 + PARTIAL_PROFIT_PCT):
+                return "PARTIAL", "PARTIAL_PROFIT", qty * 0.5
 
-    # Trailing Stop from Peak
-    if wallet["peak_price"] is not None and wallet["peak_price"] >= entry * (1 + PARTIAL_PROFIT_PCT):
-        trail_stop = wallet["peak_price"] * (1 - TRAILING_STOP_PCT)
-        if price <= trail_stop:
-            return "SELL", "TRAILING_STOP", qty
+        if wallet["peak_price"] is not None and wallet["peak_price"] >= entry * (1 + PARTIAL_PROFIT_PCT):
+            trail_stop = wallet["peak_price"] * (1 - TRAILING_STOP_PCT)
+            if price <= trail_stop:
+                return "SELL", "TRAILING_STOP", qty
 
-    if final_signal == "SELL":
-        return "SELL", "SELL_SIGNAL", qty
+        if final_signal in ("SELL", "SHORT"):
+            return "SELL", "SELL_SIGNAL", qty
+
+        return "HOLD", "", 0.0
+
+    elif pos_type == "SHORT":
+        stop_dist = max(atr * 2, entry * STOP_LOSS_PCT) if not pd.isna(atr) else entry * STOP_LOSS_PCT
+        hard_stop = entry + stop_dist
+        if price >= hard_stop:
+            return "COVER", "STOP_LOSS", qty
+
+        if wallet.get("trough_price") is None or price < wallet["trough_price"]:
+            wallet["trough_price"] = price
+
+        if not wallet.get("partial_sold", False):
+            if price <= entry * (1 - PARTIAL_PROFIT_PCT):
+                return "PARTIAL", "PARTIAL_PROFIT", qty * 0.5
+
+        if wallet["trough_price"] is not None and wallet["trough_price"] <= entry * (1 - PARTIAL_PROFIT_PCT):
+            trail_stop = wallet["trough_price"] * (1 + TRAILING_STOP_PCT)
+            if price >= trail_stop:
+                return "COVER", "TRAILING_STOP", qty
+
+        if final_signal == "BUY":
+            return "COVER", "COVER_SIGNAL", qty
+
+        return "HOLD", "", 0.0
 
     return "HOLD", "", 0.0
-
 
 # ------------------------- BACKTEST ENGINE -------------------------
 
@@ -317,7 +350,9 @@ def backtest_symbol(symbol, df_15m, df_1h, funding_df, fg_df):
         "cash": STARTING_CASH_PER_COIN,
         "coin_qty": 0.0,
         "entry_price": None,
-        "peak_price": None,               # ← NEW
+        "peak_price": None,
+        "trough_price": None,
+        "position_type": None,
         "partial_sold": False,
         "num_trades": 0,
         "win_trades": 0,
@@ -331,8 +366,8 @@ def backtest_symbol(symbol, df_15m, df_1h, funding_df, fg_df):
 
     trades = []
     equity_curve = []
-
     start_idx = max(TREND_EMA, 25)
+
     for i in range(start_idx, len(merged)):
         row = merged.iloc[i]
         prev = merged.iloc[i - 1]
@@ -358,25 +393,32 @@ def backtest_symbol(symbol, df_15m, df_1h, funding_df, fg_df):
         if wallet["coin_qty"] > 0:
             exit_action, exit_reason, exit_qty = check_exits(wallet, price, atr, final_signal)
 
-            if exit_action in ("SELL", "PARTIAL"):
+            if exit_action in ("SELL", "COVER", "PARTIAL"):
                 proceeds = exit_qty * price
                 fee = proceeds * FEE_PCT
                 entry_price = wallet["entry_price"]
+                was_short = wallet.get("position_type") == "SHORT"
 
-                wallet["cash"] += proceeds - fee
+                if exit_action in ("SELL", "COVER"):
+                    wallet["cash"] += proceeds - fee
+                else:
+                    wallet["cash"] += proceeds - fee
+
                 wallet["coin_qty"] -= exit_qty
                 wallet["num_trades"] += 1
 
-                if exit_action == "SELL":
+                if exit_action in ("SELL", "COVER"):
                     if wallet["coin_qty"] <= 1e-9:
                         wallet["coin_qty"] = 0.0
                         wallet["entry_price"] = None
                         wallet["peak_price"] = None
+                        wallet["trough_price"] = None
+                        wallet["position_type"] = None
                         wallet["partial_sold"] = False
 
-                    # Win/Loss
                     if entry_price is not None:
-                        if price > entry_price:
+                        won = (price < entry_price) if was_short else (price > entry_price)
+                        if won:
                             wallet["win_trades"] += 1
                         else:
                             wallet["loss_trades"] += 1
@@ -389,41 +431,46 @@ def backtest_symbol(symbol, df_15m, df_1h, funding_df, fg_df):
                 qty = exit_qty
 
                 trades.append({
-                    "timestamp": ts,
-                    "symbol": symbol,
-                    "action": action,
-                    "reason": reason,
-                    "price": price,
-                    "qty": qty,
-                    "cash": wallet["cash"],
+                    "timestamp": ts, "symbol": symbol, "action": action, "reason": reason,
+                    "price": price, "qty": qty, "cash": wallet["cash"],
                     "coin_qty": wallet["coin_qty"],
                     "value": wallet["cash"] + wallet["coin_qty"] * price
                 })
 
         # ENTRY
-        elif not wallet["day_halted"] and final_signal == "BUY" and wallet["cash"] > 0:
-            if row.get("move5", 0) >= MIN_MOVE_PCT and size_mult > 0:
+        elif not wallet["day_halted"] and wallet["cash"] > 0 and row.get("move5", 0) >= MIN_MOVE_PCT and size_mult > 0:
+            if final_signal == "BUY":
                 buy_qty, spend = calculate_position(wallet, price, atr, size_mult)
                 if buy_qty > 0:
                     wallet["coin_qty"] += buy_qty
                     wallet["cash"] -= spend
                     wallet["entry_price"] = price
-                    wallet["peak_price"] = price          # ← IMPORTANT
+                    wallet["peak_price"] = price
+                    wallet["position_type"] = "LONG"
                     wallet["partial_sold"] = False
                     wallet["num_trades"] += 1
-
-                    action = "BUY"
-                    reason = "BUY"
-                    qty = buy_qty
-
+                    action, reason, qty = "BUY", "BUY", buy_qty
                     trades.append({
-                        "timestamp": ts,
-                        "symbol": symbol,
-                        "action": action,
-                        "reason": reason,
-                        "price": price,
-                        "qty": qty,
-                        "cash": wallet["cash"],
+                        "timestamp": ts, "symbol": symbol, "action": action, "reason": reason,
+                        "price": price, "qty": qty, "cash": wallet["cash"],
+                        "coin_qty": wallet["coin_qty"],
+                        "value": wallet["cash"] + wallet["coin_qty"] * price
+                    })
+
+            elif final_signal == "SHORT":
+                short_qty, spend = calculate_position(wallet, price, atr, size_mult)
+                if short_qty > 0:
+                    wallet["coin_qty"] += short_qty
+                    wallet["cash"] += spend
+                    wallet["entry_price"] = price
+                    wallet["trough_price"] = price
+                    wallet["position_type"] = "SHORT"
+                    wallet["partial_sold"] = False
+                    wallet["num_trades"] += 1
+                    action, reason, qty = "SHORT", "SHORT", short_qty
+                    trades.append({
+                        "timestamp": ts, "symbol": symbol, "action": action, "reason": reason,
+                        "price": price, "qty": qty, "cash": wallet["cash"],
                         "coin_qty": wallet["coin_qty"],
                         "value": wallet["cash"] + wallet["coin_qty"] * price
                     })
