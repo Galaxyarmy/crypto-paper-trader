@@ -238,7 +238,7 @@ def apply_filters(base_signal, latest, trend_price, trend_ema, funding, fg_value
     return base_signal, size_mult
 
 def calculate_position(wallet, price, atr, size_mult):
-    portfolio = wallet["cash"] + wallet["coin_qty"] * price
+    portfolio = wallet["cash"] - wallet["coin_qty"] * price if wallet.get("position_type") == "SHORT" else wallet["cash"] + wallet["coin_qty"] * price
     if portfolio <= 0 or pd.isna(atr) or atr <= 0:
         return 0.0, 0.0
     stop_dist = max(atr * 2, price * STOP_LOSS_PCT)
@@ -476,7 +476,7 @@ def backtest_symbol(symbol, df_15m, df_1h, funding_df, fg_df):
                     })
 
         # Equity & Drawdown
-        value = wallet["cash"] + wallet["coin_qty"] * price
+        value = wallet["cash"] - wallet["coin_qty"] * price if wallet.get("position_type") == "SHORT" else wallet["cash"] + wallet["coin_qty"] * price
         if value > wallet["peak_value"]:
             wallet["peak_value"] = value
         dd = (wallet["peak_value"] - value) / wallet["peak_value"] if wallet["peak_value"] > 0 else 0
@@ -489,7 +489,7 @@ def backtest_symbol(symbol, df_15m, df_1h, funding_df, fg_df):
 
         equity_curve.append({"timestamp": ts, "value": value})
 
-    final_value = wallet["cash"] + wallet["coin_qty"] * merged.iloc[-1]["close"]
+    final_value = wallet["cash"] - wallet["coin_qty"] * merged.iloc[-1]["close"] if wallet.get("position_type") == "SHORT" else wallet["cash"] + wallet["coin_qty"] * merged.iloc[-1]["close"]
     total_trades = wallet["num_trades"]
     wins = wallet["win_trades"]
     losses = wallet["loss_trades"]
