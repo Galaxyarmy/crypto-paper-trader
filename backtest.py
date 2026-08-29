@@ -1,27 +1,16 @@
 """
-Backtest — Crypto Paper Trading Agent v6.1 strategy on historical Binance data.
+Backtest — Crypto Paper Trading Agent v6.2
+(With proper Peak-Price based Trailing Stop)
 
-Replicates (as closely as historical data allows) the exact live logic from
-paper_trader.py v6.1:
-  - EMA9/EMA21 crossover + RSI signal
-  - ADX filter (>= 20)
-  - 1H EMA50 trend filter
-  - MIN_MOVE_PCT filter (0.25%)
-  - Funding rate filter (from Binance Futures historical funding rate)
-  - Fear & Greed filter (from alternative.me historical daily index)
-  - Risk management: stop-loss, trailing-stop, partial-profit-booking (50% @ +1.5%),
-    risk-based position sizing, daily loss halt
-
-LIMITATION: Order-book imbalance is a live-only snapshot signal — free historical
-order-book data isn't available, so it is treated as neutral (0) here. This means
-the backtest slightly under-uses the size-multiplier boosts/cuts that OB imbalance
-gives live, but does not change entry/exit decisions (OB never forces a HOLD).
+Changes vs previous:
+- Fixed broken trailing stop
+- Added peak_price tracking
+- Partial sell ke baad trailing continue hota hai
+- Same logic as paper_trader.py v6.2
 
 Outputs:
-  - backtest_trades.csv   : every trade (entry/exit) with reason
-  - backtest_summary.md   : Sharpe ratio, win rate, max drawdown, per-coin stats
-
-Requirements: pip install requests pandas numpy
+  - backtest_trades.csv
+  - backtest_summary.md
 """
 
 import time
@@ -30,13 +19,13 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timezone, timedelta
 
-# ------------------------- CONFIG (mirrors paper_trader.py v6.1) -------------------------
+# ------------------------- CONFIG (mirrors paper_trader v6.2) -------------------------
 
 COINS = ["BTCUSDT", "ETHUSDT"]
 PRIMARY_INTERVAL = "15m"
 TREND_INTERVAL = "1h"
 
-BACKTEST_DAYS = 90  # how far back to test
+BACKTEST_DAYS = 90
 
 STARTING_CASH_PER_COIN = 5000.0
 FEE_PCT = 0.001
@@ -73,10 +62,9 @@ KLINE_COLS = [
     "taker_buy_base", "taker_buy_quote", "ignore"
 ]
 
-# ------------------------- DATA FETCHERS (PAGINATED, HISTORICAL) -------------------------
+# ------------------------- DATA FETCHERS -------------------------
 
 def fetch_full_klines(symbol: str, interval: str, start_ms: int, end_ms: int) -> pd.DataFrame:
-    """Fetch all klines between start_ms and end_ms, paginating in chunks of 1000."""
     all_rows = []
     cur = start_ms
     while cur < end_ms:
@@ -95,7 +83,7 @@ def fetch_full_klines(symbol: str, interval: str, start_ms: int, end_ms: int) ->
         cur = data[-1][0] + 1
         if len(data) < 1000:
             break
-        time.sleep(0.25)  # be polite to the free API
+        time.sleep(0.25)
 
     if not all_rows:
         return pd.DataFrame()
@@ -109,7 +97,6 @@ def fetch_full_klines(symbol: str, interval: str, start_ms: int, end_ms: int) ->
 
 
 def fetch_funding_history(symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
-    """Fetch historical funding rates (every 8h) for a symbol."""
     all_rows = []
     cur = start_ms
     while cur < end_ms:
@@ -139,7 +126,6 @@ def fetch_funding_history(symbol: str, start_ms: int, end_ms: int) -> pd.DataFra
 
 
 def fetch_fear_greed_history() -> pd.DataFrame:
-    """Fetch the full historical daily Fear & Greed index."""
     try:
         resp = requests.get(FEAR_GREED_URL, params={"limit": 0, "format": "json"}, timeout=15)
         resp.raise_for_status()
@@ -154,7 +140,7 @@ def fetch_fear_greed_history() -> pd.DataFrame:
     return df[["date", "fg"]].sort_values("date").reset_index(drop=True)
 
 
-# ------------------------- INDICATORS (identical to paper_trader.py) -------------------------
+# ------------------------- INDICATORS -------------------------
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
@@ -203,7 +189,7 @@ def generate_signal(prev_row, latest_row) -> str:
     return "HOLD"
 
 
-# ------------------------- FILTER ENGINE (OB imbalance neutral) -------------------------
+# ------------------------- FILTER ENGINE -------------------------
 
 def apply_filters(base_signal, latest, trend_price, trend_ema, funding, fg_value, recent_move):
     size_mult = 1.0
@@ -214,6 +200,7 @@ def apply_filters(base_signal, latest, trend_price, trend_ema, funding, fg_value
     if pd.isna(adx) or adx < ADX_MIN:
         if base_signal == "BUY":
             return "HOLD", 0.0
+
     if not pd.isna(trend_ema):
         if base_signal == "BUY" and trend_price < trend_ema:
             return "HOLD", 0.0
@@ -229,11 +216,6 @@ def apply_filters(base_signal, latest, trend_price, trend_ema, funding, fg_value
         size_mult = min(size_mult + 0.25, 1.5)
     elif fg_value >= FEAR_GREED_GREED and base_signal == "BUY":
         return "HOLD", 0.0
-
-    if base_signal == "BUY" and not pd.isna(atr):
-        stop_dist = max(atr * 2, price * STOP_LOSS_PCT)
-        target_dist = stop_dist * MIN_RISK_REWARD
-        # resistance handled by caller via rolling max passed in latest
 
     return base_signal, size_mult
 
@@ -258,22 +240,31 @@ def calculate_position(wallet, price, atr, size_mult):
 
 
 def check_exits(wallet, price, atr, final_signal):
+    """Proper Peak-Price based Trailing Stop"""
     if wallet["coin_qty"] <= 0 or wallet.get("entry_price") is None:
         return "HOLD", "", 0.0
+
     entry = wallet["entry_price"]
     qty = wallet["coin_qty"]
 
+    # Hard Stop
     stop_dist = max(atr * 2, entry * STOP_LOSS_PCT) if not pd.isna(atr) else entry * STOP_LOSS_PCT
     hard_stop = entry - stop_dist
     if price <= hard_stop:
         return "SELL", "STOP_LOSS", qty
 
+    # Update Peak
+    if wallet.get("peak_price") is None or price > wallet["peak_price"]:
+        wallet["peak_price"] = price
+
+    # Partial Profit
     if not wallet.get("partial_sold", False):
         if price >= entry * (1 + PARTIAL_PROFIT_PCT):
             return "PARTIAL", "PARTIAL_PROFIT", qty * 0.5
 
-    if price > entry * 1.03:
-        trail_stop = price * (1 - TRAILING_STOP_PCT)
+    # Trailing Stop from Peak
+    if wallet["peak_price"] is not None and wallet["peak_price"] >= entry * (1 + PARTIAL_PROFIT_PCT):
+        trail_stop = wallet["peak_price"] * (1 - TRAILING_STOP_PCT)
         if price <= trail_stop:
             return "SELL", "TRAILING_STOP", qty
 
@@ -317,10 +308,19 @@ def backtest_symbol(symbol, df_15m, df_1h, funding_df, fg_df):
     merged["move5"] = (merged["high"] - merged["low"]).rolling(5).mean() / merged["close"]
 
     wallet = {
-        "cash": STARTING_CASH_PER_COIN, "coin_qty": 0.0, "entry_price": None,
-        "partial_sold": False, "num_trades": 0, "win_trades": 0, "loss_trades": 0,
-        "day": None, "day_start_value": STARTING_CASH_PER_COIN, "day_halted": False,
-        "peak_value": STARTING_CASH_PER_COIN, "max_drawdown": 0.0,
+        "cash": STARTING_CASH_PER_COIN,
+        "coin_qty": 0.0,
+        "entry_price": None,
+        "peak_price": None,               # ← NEW
+        "partial_sold": False,
+        "num_trades": 0,
+        "win_trades": 0,
+        "loss_trades": 0,
+        "day": None,
+        "day_start_value": STARTING_CASH_PER_COIN,
+        "day_halted": False,
+        "peak_value": STARTING_CASH_PER_COIN,
+        "max_drawdown": 0.0,
     }
 
     trades = []
@@ -348,117 +348,164 @@ def backtest_symbol(symbol, df_15m, df_1h, funding_df, fg_df):
 
         action, reason, qty = "HOLD", "", 0.0
 
+        # EXIT
         if wallet["coin_qty"] > 0:
             exit_action, exit_reason, exit_qty = check_exits(wallet, price, atr, final_signal)
+
             if exit_action in ("SELL", "PARTIAL"):
                 proceeds = exit_qty * price
                 fee = proceeds * FEE_PCT
                 entry_price = wallet["entry_price"]
+
                 wallet["cash"] += proceeds - fee
                 wallet["coin_qty"] -= exit_qty
                 wallet["num_trades"] += 1
+
                 if exit_action == "SELL":
                     if wallet["coin_qty"] <= 1e-9:
                         wallet["coin_qty"] = 0.0
                         wallet["entry_price"] = None
+                        wallet["peak_price"] = None
                         wallet["partial_sold"] = False
-                    if price > entry_price:
-                        wallet["win_trades"] += 1
-                    else:
-                        wallet["loss_trades"] += 1
-                else:
+
+                    # Win/Loss
+                    if entry_price is not None:
+                        if price > entry_price:
+                            wallet["win_trades"] += 1
+                        else:
+                            wallet["loss_trades"] += 1
+
+                elif exit_action == "PARTIAL":
                     wallet["partial_sold"] = True
-                action, reason, qty = exit_action, exit_reason, exit_qty
-                trades.append([ts, symbol, action, reason, price, qty,
-                               wallet["cash"], wallet["coin_qty"]])
+
+                action = exit_action
+                reason = exit_reason
+                qty = exit_qty
+
+                trades.append({
+                    "timestamp": ts,
+                    "symbol": symbol,
+                    "action": action,
+                    "reason": reason,
+                    "price": price,
+                    "qty": qty,
+                    "cash": wallet["cash"],
+                    "coin_qty": wallet["coin_qty"],
+                    "value": wallet["cash"] + wallet["coin_qty"] * price
+                })
+
+        # ENTRY
         elif not wallet["day_halted"] and final_signal == "BUY" and wallet["cash"] > 0:
-            if row.get("move5", 0.0) >= MIN_MOVE_PCT and size_mult > 0:
-                q, spend = calculate_position(wallet, price, atr, size_mult)
-                if q > 0:
-                    wallet["coin_qty"] += q
+            if row.get("move5", 0) >= MIN_MOVE_PCT and size_mult > 0:
+                buy_qty, spend = calculate_position(wallet, price, atr, size_mult)
+                if buy_qty > 0:
+                    wallet["coin_qty"] += buy_qty
                     wallet["cash"] -= spend
                     wallet["entry_price"] = price
+                    wallet["peak_price"] = price          # ← IMPORTANT
                     wallet["partial_sold"] = False
                     wallet["num_trades"] += 1
-                    action, reason, qty = "BUY", f"BUY|size={size_mult:.0%}", q
-                    trades.append([ts, symbol, action, reason, price, qty,
-                                   wallet["cash"], wallet["coin_qty"]])
 
+                    action = "BUY"
+                    reason = "BUY"
+                    qty = buy_qty
+
+                    trades.append({
+                        "timestamp": ts,
+                        "symbol": symbol,
+                        "action": action,
+                        "reason": reason,
+                        "price": price,
+                        "qty": qty,
+                        "cash": wallet["cash"],
+                        "coin_qty": wallet["coin_qty"],
+                        "value": wallet["cash"] + wallet["coin_qty"] * price
+                    })
+
+        # Equity & Drawdown
         value = wallet["cash"] + wallet["coin_qty"] * price
-        wallet["peak_value"] = max(wallet.get("peak_value", value), value)
+        if value > wallet["peak_value"]:
+            wallet["peak_value"] = value
         dd = (wallet["peak_value"] - value) / wallet["peak_value"] if wallet["peak_value"] > 0 else 0
-        wallet["max_drawdown"] = max(wallet.get("max_drawdown", 0), dd)
+        if dd > wallet["max_drawdown"]:
+            wallet["max_drawdown"] = dd
 
         day_loss = (wallet["day_start_value"] - value) / wallet["day_start_value"] if wallet["day_start_value"] > 0 else 0
         if day_loss >= MAX_DAILY_LOSS_PCT:
             wallet["day_halted"] = True
 
-        equity_curve.append((ts, value))
+        equity_curve.append({"timestamp": ts, "value": value})
 
-    equity_df = pd.DataFrame(equity_curve, columns=["time", "value"]).set_index("time")
-    return wallet, trades, equity_df
+    final_value = wallet["cash"] + wallet["coin_qty"] * merged.iloc[-1]["close"]
+    total_trades = wallet["num_trades"]
+    wins = wallet["win_trades"]
+    losses = wallet["loss_trades"]
+    win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
 
-
-def compute_sharpe(equity_df, bars_per_day=96):
-    if equity_df.empty:
-        return 0.0
-    daily = equity_df["value"].resample("1D").last().dropna()
-    returns = daily.pct_change().dropna()
-    if returns.std() == 0 or len(returns) < 2:
-        return 0.0
-    return (returns.mean() / returns.std()) * np.sqrt(365)
+    return {
+        "symbol": symbol,
+        "start_value": STARTING_CASH_PER_COIN,
+        "end_value": final_value,
+        "return_pct": (final_value - STARTING_CASH_PER_COIN) / STARTING_CASH_PER_COIN * 100,
+        "total_trades": total_trades,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": win_rate,
+        "max_drawdown": wallet["max_drawdown"] * 100,
+        "trades": trades,
+        "equity": equity_curve
+    }
 
 
 def main():
-    end_dt = datetime.now(timezone.utc)
-    start_dt = end_dt - timedelta(days=BACKTEST_DAYS)
-    start_ms, end_ms = int(start_dt.timestamp() * 1000), int(end_dt.timestamp() * 1000)
+    print("Starting Backtest v6.2 (Peak Trailing Stop)...")
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=BACKTEST_DAYS)
+    start_ms = int(start.timestamp() * 1000)
+    end_ms = int(end.timestamp() * 1000)
 
-    print(f"[INFO] Backtesting {BACKTEST_DAYS} days: {start_dt.date()} -> {end_dt.date()}")
     fg_df = fetch_fear_greed_history()
+    print(f"Fear & Greed history loaded: {len(fg_df)} days")
 
+    all_results = []
     all_trades = []
-    summary_lines = [f"# Backtest Summary — v6.1 strategy\n",
-                      f"Period: {start_dt.date()} to {end_dt.date()} ({BACKTEST_DAYS} days)\n"]
 
     for symbol in COINS:
-        print(f"\n[FETCH] {symbol} klines...")
+        print(f"\nProcessing {symbol}...")
         df_15m = fetch_full_klines(symbol, PRIMARY_INTERVAL, start_ms, end_ms)
         df_1h = fetch_full_klines(symbol, TREND_INTERVAL, start_ms, end_ms)
         funding_df = fetch_funding_history(symbol, start_ms, end_ms)
 
         if df_15m.empty or df_1h.empty:
-            print(f"[SKIP] No data for {symbol}")
+            print(f"Skipping {symbol} - no data")
             continue
 
-        print(f"[RUN] Simulating {symbol} ({len(df_15m)} 15m bars)...")
-        wallet, trades, equity_df = backtest_symbol(symbol, df_15m, df_1h, funding_df, fg_df)
-        all_trades.extend(trades)
+        result = backtest_symbol(symbol, df_15m, df_1h, funding_df, fg_df)
+        all_results.append(result)
+        all_trades.extend(result["trades"])
 
-        sharpe = compute_sharpe(equity_df)
-        final_value = wallet["cash"] + wallet["coin_qty"] * df_15m.iloc[-1]["close"]
-        total_return = (final_value - STARTING_CASH_PER_COIN) / STARTING_CASH_PER_COIN * 100
-        total = wallet["num_trades"]
-        wins = wallet["win_trades"]
-        wr = (wins / (wallet["win_trades"] + wallet["loss_trades"]) * 100) if (wallet["win_trades"] + wallet["loss_trades"]) > 0 else 0
+        print(f"  Return: {result['return_pct']:.2f}% | WinRate: {result['win_rate']:.1f}% | "
+              f"MaxDD: {result['max_drawdown']:.2f}% | Trades: {result['total_trades']}")
 
-        summary_lines.append(f"## {symbol}\n")
-        summary_lines.append(f"- Start: ${STARTING_CASH_PER_COIN:,.2f} -> End: ${final_value:,.2f} ({total_return:+.2f}%)\n")
-        summary_lines.append(f"- Total trades (buy+sell+partial): {total}\n")
-        summary_lines.append(f"- Win rate (closed round-trips): {wr:.1f}% ({wins}W / {wallet['loss_trades']}L)\n")
-        summary_lines.append(f"- Max drawdown: {wallet['max_drawdown']*100:.2f}%\n")
-        summary_lines.append(f"- Sharpe ratio (annualized, daily returns): {sharpe:.2f}\n")
-        print(f"[RESULT] {symbol}: {total_return:+.2f}% | WinRate={wr:.1f}% | MaxDD={wallet['max_drawdown']*100:.2f}% | Sharpe={sharpe:.2f}")
+    # Save trades
+    if all_trades:
+        pd.DataFrame(all_trades).to_csv(RESULTS_CSV, index=False)
+        print(f"\nTrades saved to {RESULTS_CSV}")
 
-    with open(RESULTS_CSV, "w") as f:
-        f.write("timestamp,symbol,action,reason,price,qty,cash,coin_qty\n")
-        for t in all_trades:
-            f.write(",".join(str(x) for x in t) + "\n")
-
+    # Summary
     with open(SUMMARY_MD, "w") as f:
-        f.write("\n".join(summary_lines))
+        f.write("# Backtest Summary — v6.2 (Peak Trailing Stop)\n\n")
+        f.write(f"Period: {start.date()} to {end.date()} ({BACKTEST_DAYS} days)\n\n")
 
-    print(f"\n[DONE] Wrote {RESULTS_CSV} and {SUMMARY_MD}")
+        for r in all_results:
+            f.write(f"## {r['symbol']}\n\n")
+            f.write(f"- Start: ${r['start_value']:,.2f} → End: ${r['end_value']:,.2f} ({r['return_pct']:+.2f}%)\n")
+            f.write(f"- Total trades: {r['total_trades']}\n")
+            f.write(f"- Win rate: {r['win_rate']:.1f}% ({r['wins']}W / {r['losses']}L)\n")
+            f.write(f"- Max drawdown: {r['max_drawdown']:.2f}%\n\n")
+
+    print(f"Summary saved to {SUMMARY_MD}")
+    print("\nBacktest completed.")
 
 
 if __name__ == "__main__":
