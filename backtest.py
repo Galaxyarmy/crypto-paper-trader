@@ -399,8 +399,8 @@ def backtest_symbol(symbol, df_15m, df_1h, funding_df, fg_df):
                 entry_price = wallet["entry_price"]
                 was_short = wallet.get("position_type") == "SHORT"
 
-                if exit_action in ("SELL", "COVER"):
-                    wallet["cash"] += proceeds - fee
+                if exit_action == "COVER":
+                    wallet["cash"] -= proceeds + fee
                 else:
                     wallet["cash"] += proceeds - fee
 
