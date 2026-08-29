@@ -48,6 +48,7 @@ MAX_DAILY_LOSS_PCT = 0.03
 MIN_RISK_REWARD = 1.5
 
 ADX_MIN = 20.0
+EMA_SEP_MIN_PCT = 0.0015   # NEW: min 0.15% separation between EMA9 & EMA21
 OB_IMBALANCE_THRESHOLD = 0.10
 FUNDING_EXTREME = 0.0005
 FEAR_GREED_FEAR = 25
@@ -285,6 +286,13 @@ def apply_filters(symbol: str, base_signal: str,
             return "HOLD", "FILTER:" + ",".join(reasons), 0
     else:
         reasons.append(f"ADX_OK({adx:.1f})")
+        ema_sep = abs(latest["ema_short"] - latest["ema_long"]) / price
+        if ema_sep < EMA_SEP_MIN_PCT:
+            reasons.append(f"EMA_FLAT(sep={ema_sep:.4%})")
+            if base_signal == "BUY":
+                return "HOLD", "FILTER:" + ",".join(reasons), 0
+        else:
+            reasons.append(f"EMA_SEP_OK({ema_sep:.4%})")
 
     if len(trend_df) > TREND_EMA:
         trend_price = float(trend_df.iloc[-1]["close"])
