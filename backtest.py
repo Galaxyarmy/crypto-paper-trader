@@ -202,7 +202,8 @@ def apply_filters(base_signal, latest, trend_price, trend_ema, funding, fg_value
     atr = latest["atr"]
 
     is_entry_signal = base_signal in ("BUY", "SHORT")
-
+    breakout_ok = (base_signal != "BUY" or (not pd.isna(latest.get("res20")) and price >= latest["res20"])) and (base_signal != "SHORT" or (not pd.isna(latest.get("sup20")) and price <= latest["sup20"]))
+  
     if pd.isna(adx) or adx < ADX_MIN:
         if is_entry_signal:
             return "HOLD", 0.0
@@ -223,7 +224,7 @@ def apply_filters(base_signal, latest, trend_price, trend_ema, funding, fg_value
             size_mult = min(size_mult + 0.25, 1.5)
 
     if base_signal == "SHORT":
-        return base_signal, size_mult
+        return (base_signal if breakout_ok else "HOLD"), size_mult
 
     if funding > FUNDING_EXTREME and base_signal == "BUY":
         return "HOLD", 0.0
@@ -235,7 +236,7 @@ def apply_filters(base_signal, latest, trend_price, trend_ema, funding, fg_value
     elif fg_value >= FEAR_GREED_GREED and base_signal == "BUY":
         return "HOLD", 0.0
 
-    return base_signal, size_mult
+    return (base_signal if breakout_ok else "HOLD"), size_mult
 
 def calculate_position(wallet, price, atr, size_mult):
     portfolio = wallet["cash"] - wallet["coin_qty"] * price if wallet.get("position_type") == "SHORT" else wallet["cash"] + wallet["coin_qty"] * price
@@ -344,6 +345,7 @@ def backtest_symbol(symbol, df_15m, df_1h, funding_df, fg_df):
         merged["fg"] = 50
 
     merged["res20"] = merged["high"].rolling(20).max()
+    merged["sup20"] = merged["low"].rolling(20).min()
     merged["move5"] = (merged["high"] - merged["low"]).rolling(5).mean() / merged["close"]
 
     wallet = {
