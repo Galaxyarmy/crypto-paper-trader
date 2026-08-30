@@ -1,5 +1,5 @@
 {
-  "schema_version": 6.2,
+  "schema_version": 6.3,
   "coins": {
     "BTCUSDT": {
       "cash": 5000.0,
