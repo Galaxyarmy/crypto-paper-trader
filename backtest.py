@@ -202,7 +202,7 @@ def apply_filters(base_signal, latest, trend_price, trend_ema, funding, fg_value
     atr = latest["atr"]
 
     is_entry_signal = base_signal in ("BUY", "SHORT")
-    breakout_ok = (base_signal != "BUY" or (not pd.isna(latest.get("res20")) and price >= latest["res20"])) and (base_signal != "SHORT" or (not pd.isna(latest.get("sup20")) and price <= latest["sup20"]))
+    breakout_ok = (base_signal != "BUY" or price >= latest.get("res20", price) * 0.998) and (base_signal != "SHORT" or price <= latest.get("sup20", price) * 1.002)
   
     if pd.isna(adx) or adx < ADX_MIN:
         if is_entry_signal:
