@@ -34,11 +34,14 @@ jobs:
       - name: Run trading agent
         run: python paper_trader.py
 
+      - name: Log OI/price snapshot
+        run: python oi_logger.py
+
       - name: Commit updated state
         run: |
           git config user.name "trading-bot"
           git config user.email "trading-bot@users.noreply.github.com"
-          git add state.json trade_log_v6.csv
+          git add state.json trade_log_v7.csv oi_log.csv
           git diff --quiet --cached || git commit -m "Update paper trading state [skip ci]"
           # Pull any changes that landed between our checkout and now,
           # then push. If nothing changed, this is a no-op.
