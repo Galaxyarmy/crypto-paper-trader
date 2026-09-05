@@ -35,7 +35,7 @@ ATR_STOP_MULT = 2.0                  # stop distance = max(ATR * this, price * S
 # ---- Signal: liquidity sweep + OI delta (replaces EMA/RSI/Fear&Greed/OrderBookImbalance) ----
 SWEEP_WICK_MIN_PCT = 0.0015          # wick must clear the prior 24h level by at least this % to count as a real sweep
 OI_DELTA_LOOKBACK_CANDLES = 4        # compare current OI to OI this many 15m candles ago (4 = 1h)
-OI_DELTA_MIN_PCT = 0.02              # OI must have moved at least this % in the confirming direction
+OI_DELTA_MIN_PCT = 0.003              # OI must have moved at least this % in the confirming direction
 
 # ---- Execution realism (backtest only — live fills at whatever the market gives it) ----
 BACKTEST_SLIPPAGE_PCT = 0.0005

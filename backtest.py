@@ -142,6 +142,12 @@ def run_backtest(symbol: str, df: pd.DataFrame, oi_df: pd.DataFrame,
     df = eng.add_oi_delta(df)
 
     df["signal"] = df.apply(eng.generate_signal, axis=1)
+    raw_sweeps = df["sweep_signal"].notna().sum()
+    sweep_in_oi_window = ((df["sweep_signal"].notna()) & (df["open_interest"].notna())).sum()
+    print(f"  Sweeps inside OI-covered window: {sweep_in_oi_window}")
+    oi_moves = df.loc[df["sweep_signal"].notna(), "oi_pct_change"]
+    print(f"  OI %% change on those sweep candles: {oi_moves.dropna().round(4).tolist()}")
+    print(f"  Raw sweep candles (pre-OI-filter): {raw_sweeps}")
     oi_covered = df["open_interest"].notna().sum()
     print(f"  OI coverage: {oi_covered}/{len(df)} candles "
           f"({df['open_time'].iloc[0].date() if oi_covered else 'n/a'} onward)")
