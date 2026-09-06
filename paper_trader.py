@@ -1,464 +1,161 @@
 """
-Crypto Paper Trading Agent v6.3
-Fixes:
-- Proper Peak/Trough Trailing Stop
-- Correct Short Equity calculation
-- Fixed Short Win/Loss counting
-- EMA_SEP_MIN_PCT = 0.0015
+Crypto Paper Trading Agent v7.0 — SMC / Isolated-Margin Futures Rewrite
+
+Runs once per invocation (designed for a GitHub Actions cron job every
+15 minutes — no persistent connection, so no WebSocket; see config.py's
+top-of-file note for why). All signal and accounting logic lives in
+engine.py and is shared byte-for-byte with backtest.py.
+
+Changes vs v6.2:
+- Removed EMA9/21, RSI, Fear & Greed, Order Book Imbalance entirely.
+- New entry signal: 24h liquidity sweep + Open Interest delta (engine.py).
+- Moved from Binance spot klines to Binance USDT-M Futures klines/OI/funding.
+- Accounting rebuilt around isolated-margin collateral + side-aware PnL —
+  fixes the short-equity-sign bug and the short win/loss-counting bug
+  that Codex's audit found in v6.2's live script.
+- Exits now walk the just-closed candle's high/low path (not close-only),
+  and a liquidation check runs before the stop check.
+- state.json schema changed completely (position_side/qty/margin_locked
+  instead of coin_qty/cash-only). Old v6.2 state is NOT migrated — it was
+  built on accounting that this rewrite intentionally replaces, and it's
+  paper money, so this starts every symbol fresh at $5,000 rather than
+  attempting a lossy conversion. You'll see a one-time log line about this.
+
+Requirements: pip install requests pandas
 """
 
 import json
-import csv
 import os
+import csv
 import time
 from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import pandas as pd
 
-# ------------------------- CONFIG -------------------------
+import config as cfg
+import engine as eng
 
-COINS = ["BTCUSDT", "ETHUSDT"]
-PRIMARY_INTERVAL = "15m"
-TREND_INTERVAL = "1h"
-
-STARTING_CASH_PER_COIN = 5000.0
-FEE_PCT = 0.001
-
-EMA_SHORT = 9
-EMA_LONG = 21
-TREND_EMA = 50
-RSI_PERIOD = 14
-RSI_OVERBOUGHT = 70
-
-STOP_LOSS_PCT = 0.02
-TRAILING_STOP_PCT = 0.015
-PARTIAL_PROFIT_PCT = 0.015
-POSITION_SIZE_PCT = 0.5
-MIN_MOVE_PCT = 0.0025
-MAX_DAILY_LOSS_PCT = 0.03
-MIN_RISK_REWARD = 1.5
-
-ADX_MIN = 20.0
-EMA_SEP_MIN_PCT = 0.0015
-OB_IMBALANCE_THRESHOLD = 0.10
-FUNDING_EXTREME = 0.0005
-FEAR_GREED_FEAR = 25
-FEAR_GREED_GREED = 75
-
-STATE_FILE = "state.json"
-LOG_FILE = "trade_log_v6.csv"
-
-BINANCE_SPOT = "https://data-api.binance.vision/api/v3"
-BINANCE_FUTURES = "https://fapi.binance.com/fapi/v1"
-FEAR_GREED_URL = "https://api.alternative.me/fng/?limit=1"
-
-SCHEMA_VERSION = 6.3
 
 # -------------------- HTTP SESSION --------------------
 
 def get_robust_session() -> requests.Session:
     session = requests.Session()
-    retries = Retry(total=4, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504], raise_on_status=False)
+    retries = Retry(total=4, backoff_factor=1,
+                     status_forcelist=[429, 500, 502, 503, 504],
+                     raise_on_status=False)
     adapter = HTTPAdapter(max_retries=retries)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     return session
 
+
 HTTP = get_robust_session()
+
 
 # -------------------- STATE --------------------
 
 def default_state() -> dict:
-    today = datetime.now(timezone.utc).date().isoformat()
     return {
-        "schema_version": SCHEMA_VERSION,
-        "coins": {
-            symbol: {
-                "cash": STARTING_CASH_PER_COIN,
-                "coin_qty": 0.0,
-                "num_trades": 0,
-                "win_trades": 0,
-                "loss_trades": 0,
-                "entry_price": None,
-                "peak_price": None,
-                "trough_price": None,
-                "position_type": None,
-                "partial_sold": False,
-                "partial_qty": 0.0,
-                "day": today,
-                "day_start_value": STARTING_CASH_PER_COIN,
-                "day_halted": False,
-                "peak_value": STARTING_CASH_PER_COIN,
-                "max_drawdown": 0.0,
-            }
-            for symbol in COINS
-        }
+        "schema_version": cfg.SCHEMA_VERSION,
+        "coins": {symbol: eng.default_wallet() for symbol in cfg.COINS},
     }
 
 
 def load_state() -> dict:
-    if os.path.isfile(STATE_FILE):
-        with open(STATE_FILE) as f:
+    if not os.path.isfile(cfg.STATE_FILE):
+        return default_state()
+    with open(cfg.STATE_FILE) as f:
+        try:
             state = json.load(f)
-    else:
-        state = {}
+        except Exception:
+            print("[WARN] state.json unreadable — starting fresh.")
+            return default_state()
 
-    if "coins" not in state:
-        migrated = {}
-        has_old = False
-        for sym in COINS:
-            if sym in state:
-                migrated[sym] = state[sym]
-                has_old = True
-            else:
-                migrated[sym] = default_state()["coins"][sym]
-        new_state = default_state()
-        new_state["coins"] = migrated
-        state = new_state
-        if has_old:
-            print("[INFO] Migrated old state -> v6.3")
-    else:
-        defaults = default_state()
-        for sym in COINS:
-            if sym not in state["coins"]:
-                state["coins"][sym] = defaults["coins"][sym]
-            for k, v in defaults["coins"][sym].items():
-                state["coins"][sym].setdefault(k, v)
+    if state.get("schema_version") != cfg.SCHEMA_VERSION:
+        print(f"[INFO] state.json is schema {state.get('schema_version')}, "
+              f"this build is {cfg.SCHEMA_VERSION}. Old accounting model is "
+              f"incompatible with the new isolated-margin engine — resetting "
+              f"all symbols to fresh ${cfg.STARTING_CASH_PER_COIN:,.0f} paper "
+              f"balances rather than converting stale numbers. (No real money "
+              f"involved — this is a paper simulator.)")
+        return default_state()
 
-    state["schema_version"] = SCHEMA_VERSION
+    # Fill in any symbols missing from an otherwise-current state file.
+    for symbol in cfg.COINS:
+        state["coins"].setdefault(symbol, eng.default_wallet())
     return state
 
 
 def save_state(state: dict):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+    with open(cfg.STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2, default=str)
 
 
-# -------------------- DATA FETCHERS --------------------
+# -------------------- DATA FETCHERS (Binance USDT-M Futures) --------------------
 
-def fetch_klines(symbol: str, interval: str, limit: int = 150) -> pd.DataFrame:
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
+def fetch_klines(symbol: str, limit: int = 150) -> pd.DataFrame:
+    """Fetches recent futures klines, drops the still-forming last candle."""
+    params = {"symbol": symbol, "interval": cfg.PRIMARY_INTERVAL, "limit": limit}
     try:
-        resp = HTTP.get(f"{BINANCE_SPOT}/klines", params=params, timeout=10)
+        resp = HTTP.get(cfg.KLINES_ENDPOINT, params=params, timeout=10)
         resp.raise_for_status()
         data = resp.json()
-        df = pd.DataFrame(data, columns=[
-            "open_time", "open", "high", "low", "close", "volume",
-            "close_time", "quote_asset_volume", "trades",
-            "taker_buy_base", "taker_buy_quote", "ignore"
-        ])
+        df = pd.DataFrame(data, columns=cfg.KLINE_COLS)
         for col in ["open", "high", "low", "close", "volume"]:
             df[col] = df[col].astype(float)
-        return df.iloc[:-1].reset_index(drop=True)
+        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+        return df.iloc[:-1].reset_index(drop=True)   # drop unfinished candle
     except Exception as e:
-        print(f"[ERROR] Kline fetch failed for {symbol} ({interval}): {e}")
+        print(f"[ERROR] Kline fetch failed for {symbol}: {e}")
         return pd.DataFrame()
 
 
-def fetch_order_book(symbol: str, limit: int = 100) -> dict:
+def fetch_oi_hist(symbol: str, limit: int = 12) -> pd.DataFrame:
+    """Last `limit` open-interest points at the primary interval. Binance's
+    free tier only serves ~30 days of this — fine for live (we only need
+    OI_DELTA_LOOKBACK_CANDLES+buffer points), but see BACKTEST_DAYS in
+    config.py for how backtest.py stays inside that window."""
+    params = {"symbol": symbol, "period": cfg.PRIMARY_INTERVAL, "limit": limit}
     try:
-        params = {"symbol": symbol, "limit": limit}
-        resp = HTTP.get(f"{BINANCE_SPOT}/depth", params=params, timeout=8)
+        resp = HTTP.get(cfg.OPEN_INTEREST_HIST_ENDPOINT, params=params, timeout=10)
         resp.raise_for_status()
         data = resp.json()
-        bid_vol = sum(float(b[1]) for b in data["bids"])
-        ask_vol = sum(float(a[1]) for a in data["asks"])
-        total = bid_vol + ask_vol
-        imbalance = (bid_vol - ask_vol) / total if total > 0 else 0
-        return {"imbalance": imbalance, "bid_vol": bid_vol, "ask_vol": ask_vol}
+        if not data:
+            return pd.DataFrame(columns=["time", "open_interest"])
+        df = pd.DataFrame(data)
+        df["time"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        df["open_interest"] = df["sumOpenInterest"].astype(float)
+        return df[["time", "open_interest"]].sort_values("time").reset_index(drop=True)
     except Exception as e:
-        print(f"[WARN] OrderBook failed for {symbol}: {e}")
-        return {"imbalance": 0.0, "bid_vol": 0.0, "ask_vol": 0.0}
+        print(f"[WARN] OI history fetch failed for {symbol}: {e}")
+        return pd.DataFrame(columns=["time", "open_interest"])
 
 
 def fetch_funding_rate(symbol: str) -> float:
     try:
-        params = {"symbol": symbol, "limit": 1}
-        resp = HTTP.get(f"{BINANCE_FUTURES}/fundingRate", params=params, timeout=8)
+        resp = HTTP.get(cfg.MARK_PRICE_ENDPOINT, params={"symbol": symbol}, timeout=8)
         resp.raise_for_status()
-        return float(resp.json()[0]["fundingRate"])
+        return float(resp.json()["lastFundingRate"])
     except Exception as e:
-        print(f"[WARN] Funding failed for {symbol}: {e}")
+        print(f"[WARN] Funding rate fetch failed for {symbol}: {e}")
         return 0.0
 
 
-def fetch_fear_greed() -> dict:
-    try:
-        resp = HTTP.get(FEAR_GREED_URL, timeout=8)
-        resp.raise_for_status()
-        d = resp.json()["data"][0]
-        return {"value": int(d["value"]), "class": d["value_classification"]}
-    except Exception as e:
-        print(f"[WARN] Fear & Greed failed: {e}")
-        return {"value": 50, "class": "Neutral"}
-
-
-# -------------------- INDICATORS --------------------
-
-def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-
-    df["ema_short"] = df["close"].ewm(span=EMA_SHORT, adjust=False).mean()
-    df["ema_long"] = df["close"].ewm(span=EMA_LONG, adjust=False).mean()
-    df["ema_trend"] = df["close"].ewm(span=TREND_EMA, adjust=False).mean()
-
-    delta = df["close"].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / RSI_PERIOD, min_periods=RSI_PERIOD).mean()
-    avg_loss = loss.ewm(alpha=1 / RSI_PERIOD, min_periods=RSI_PERIOD).mean()
-    rs = avg_gain / avg_loss.replace(0, 1e-9)
-    df["rsi"] = 100 - (100 / (1 + rs))
-
-    hl = df["high"] - df["low"]
-    hc = (df["high"] - df["close"].shift()).abs()
-    lc = (df["low"] - df["close"].shift()).abs()
-    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-    df["atr"] = tr.rolling(14).mean()
-
-    plus_dm = df["high"].diff()
-    minus_dm = -df["low"].diff()
-    plus_dm[plus_dm < 0] = 0
-    minus_dm[minus_dm < 0] = 0
-    plus_dm[plus_dm <= minus_dm] = 0
-    minus_dm[minus_dm <= plus_dm] = 0
-    atr = df["atr"]
-    plus_di = 100 * plus_dm.rolling(14).mean() / atr.replace(0, 1e-9)
-    minus_di = 100 * minus_dm.rolling(14).mean() / atr.replace(0, 1e-9)
-    dx = (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, 1e-9)) * 100
-    df["adx"] = dx.rolling(14).mean()
-
-    return df
-
-
-def generate_signal(df: pd.DataFrame) -> str:
-    if len(df) < 2:
-        return "HOLD"
-    prev = df.iloc[-2]
-    latest = df.iloc[-1]
-    crossed_up = prev["ema_short"] <= prev["ema_long"] and latest["ema_short"] > latest["ema_long"]
-    crossed_down = prev["ema_short"] >= prev["ema_long"] and latest["ema_short"] < latest["ema_long"]
-
-    if crossed_up and latest["rsi"] < RSI_OVERBOUGHT:
-        return "BUY"
-    if crossed_down:
-        return "SHORT"
-    if latest["rsi"] > RSI_OVERBOUGHT:
-        return "SELL"
-    return "HOLD"
-
-
-def recent_move_pct(df: pd.DataFrame, lookback: int = 5) -> float:
-    if len(df) < lookback:
-        return 0.0
-    recent = df.iloc[-lookback:]
-    avg_range = (recent["high"] - recent["low"]).mean()
-    return avg_range / df.iloc[-1]["close"]
-
-
-# -------------------- FILTER ENGINE --------------------
-
-def apply_filters(symbol: str, base_signal: str,
-                  primary_df: pd.DataFrame, trend_df: pd.DataFrame,
-                  funding: float, fg: dict, ob: dict) -> tuple:
-    reasons = []
-    size_mult = 1.0
-    latest = primary_df.iloc[-1]
-    price = latest["close"]
-    adx = latest["adx"]
-    atr = latest["atr"]
-
-    is_entry_signal = base_signal in ("BUY", "SHORT")
-
-    if pd.isna(adx) or adx < ADX_MIN:
-        reasons.append(f"ADX_WEAK({adx:.1f})" if not pd.isna(adx) else "ADX_WEAK(nan)")
-        if is_entry_signal:
-            return "HOLD", "FILTER:" + ",".join(reasons), 0
-    else:
-        reasons.append(f"ADX_OK({adx:.1f})")
-        ema_sep = abs(latest["ema_short"] - latest["ema_long"]) / price
-        if ema_sep < EMA_SEP_MIN_PCT:
-            reasons.append(f"EMA_FLAT(sep={ema_sep:.4%})")
-            if is_entry_signal:
-                return "HOLD", "FILTER:" + ",".join(reasons), 0
-        else:
-            reasons.append(f"EMA_SEP_OK({ema_sep:.4%})")
-
-    if len(trend_df) > TREND_EMA:
-        trend_price = float(trend_df.iloc[-1]["close"])
-        trend_ema = float(trend_df.iloc[-1]["ema_trend"])
-
-        if base_signal == "BUY" and trend_price < trend_ema:
-            reasons.append(f"1H_BELOW_EMA50({trend_price:.0f}<{trend_ema:.0f})")
-            return "HOLD", "FILTER:" + ",".join(reasons), 0
-        if base_signal == "BUY" and trend_price > trend_ema:
-            reasons.append("1H_ABOVE_EMA50")
-            size_mult = min(size_mult + 0.25, 1.5)
-
-        if base_signal == "SHORT" and trend_price > trend_ema:
-            reasons.append(f"1H_ABOVE_EMA50({trend_price:.0f}>{trend_ema:.0f})")
-            return "HOLD", "FILTER:" + ",".join(reasons), 0
-        if base_signal == "SHORT" and trend_price < trend_ema:
-            reasons.append("1H_BELOW_EMA50")
-            size_mult = min(size_mult + 0.25, 1.5)
-
-    if base_signal == "SHORT":
-        return base_signal, "FILTER_OK:" + ",".join(reasons), size_mult
-
-    ob_imb = ob.get("imbalance", 0)
-    if abs(ob_imb) > OB_IMBALANCE_THRESHOLD:
-        if base_signal == "BUY" and ob_imb < -OB_IMBALANCE_THRESHOLD:
-            reasons.append(f"OB_SELL_PRESSURE({ob_imb:+.2f})")
-            size_mult = max(size_mult - 0.25, 0.5)
-        elif base_signal == "BUY" and ob_imb > OB_IMBALANCE_THRESHOLD:
-            reasons.append(f"OB_BUY_PRESSURE({ob_imb:+.2f})")
-            size_mult = min(size_mult + 0.25, 1.5)
-
-    if funding > FUNDING_EXTREME:
-        reasons.append(f"FUNDING_HIGH({funding:.4%})")
-        if base_signal == "BUY":
-            return "HOLD", "FILTER:" + ",".join(reasons), 0
-    elif funding < -FUNDING_EXTREME:
-        reasons.append(f"FUNDING_NEG({funding:.4%})")
-        if base_signal == "BUY":
-            size_mult = min(size_mult + 0.25, 1.5)
-
-    if fg["value"] <= FEAR_GREED_FEAR:
-        reasons.append(f"EXTREME_FEAR({fg['value']})")
-        if base_signal == "BUY":
-            size_mult = min(size_mult + 0.25, 1.5)
-    elif fg["value"] >= FEAR_GREED_GREED:
-        reasons.append(f"EXTREME_GREED({fg['value']})")
-        if base_signal == "BUY":
-            return "HOLD", "FILTER:" + ",".join(reasons), 0
-
-    if base_signal == "BUY" and not pd.isna(atr):
-        stop_dist = max(atr * 2, price * STOP_LOSS_PCT)
-        target_dist = stop_dist * MIN_RISK_REWARD
-        resistance = primary_df["high"].rolling(20).max().iloc[-1]
-        upside_to_res = resistance - price
-        if upside_to_res < target_dist:
-            reasons.append(f"RR_POOR(upside={upside_to_res:.0f}<target={target_dist:.0f})")
-            size_mult = max(size_mult - 0.25, 0.5)
-        else:
-            reasons.append(f"RR_OK(1:{upside_to_res/stop_dist:.1f})")
-
-    return base_signal, "FILTER_OK:" + ",".join(reasons), size_mult
-
-
-# -------------------- POSITION & EXIT LOGIC --------------------
-
-def get_portfolio_value(wallet: dict, price: float) -> float:
-    """Correct equity for both LONG and SHORT"""
-    if wallet.get("position_type") == "SHORT":
-        return wallet["cash"] - wallet["coin_qty"] * price
-    else:
-        return wallet["cash"] + wallet["coin_qty"] * price
-
-
-def calculate_position(wallet: dict, price: float, atr: float, size_mult: float) -> tuple:
-    portfolio = get_portfolio_value(wallet, price)
-    if portfolio <= 0 or pd.isna(atr) or atr <= 0:
-        return 0.0, 0.0
-    stop_dist = max(atr * 2, price * STOP_LOSS_PCT)
-    stop_pct = stop_dist / price
-    if stop_pct <= 0:
-        return 0.0, 0.0
-    max_risk = portfolio * 0.02
-    pos_dollars = max_risk / stop_pct
-    max_spend = wallet["cash"] * POSITION_SIZE_PCT * size_mult
-    spend = min(pos_dollars, max_spend)
-    if spend <= 0 or spend > wallet["cash"]:
-        return 0.0, 0.0
-    fee = spend * FEE_PCT
-    qty = (spend - fee) / price
-    return qty, spend
-
-
-def check_exits(wallet: dict, price: float, atr: float, final_signal: str) -> tuple:
-    if wallet["coin_qty"] <= 0 or wallet.get("entry_price") is None:
-        return "HOLD", "", 0.0
-
-    entry = wallet["entry_price"]
-    current_qty = wallet["coin_qty"]
-    pos_type = wallet.get("position_type", "LONG")
-
-    # ========== LONG ==========
-    if pos_type == "LONG":
-        stop_dist = max(atr * 2, entry * STOP_LOSS_PCT) if not pd.isna(atr) else entry * STOP_LOSS_PCT
-        hard_stop = entry - stop_dist
-        if price <= hard_stop:
-            return "SELL", f"STOP_LOSS|hard@{hard_stop:.0f}", current_qty
-
-        if wallet.get("peak_price") is None or price > wallet["peak_price"]:
-            wallet["peak_price"] = price
-
-        if not wallet.get("partial_sold", False):
-            if price >= entry * (1 + PARTIAL_PROFIT_PCT):
-                return "PARTIAL", f"PARTIAL_PROFIT|+{PARTIAL_PROFIT_PCT:.1%}", current_qty * 0.5
-
-        if wallet["peak_price"] is not None and wallet["peak_price"] >= entry * (1 + PARTIAL_PROFIT_PCT):
-            trail_stop = wallet["peak_price"] * (1 - TRAILING_STOP_PCT)
-            if price <= trail_stop:
-                return "SELL", f"TRAILING_STOP|peak={wallet['peak_price']:.0f}", current_qty
-
-        if final_signal in ("SELL", "SHORT"):
-            return "SELL", "SELL_SIGNAL", current_qty
-
-        return "HOLD", "", 0.0
-
-    # ========== SHORT ==========
-    elif pos_type == "SHORT":
-        stop_dist = max(atr * 2, entry * STOP_LOSS_PCT) if not pd.isna(atr) else entry * STOP_LOSS_PCT
-        hard_stop = entry + stop_dist
-        if price >= hard_stop:
-            return "SELL", f"STOP_LOSS|hard@{hard_stop:.0f}", current_qty
-
-        if wallet.get("trough_price") is None or price < wallet["trough_price"]:
-            wallet["trough_price"] = price
-
-        if not wallet.get("partial_sold", False):
-            if price <= entry * (1 - PARTIAL_PROFIT_PCT):
-                return "PARTIAL", f"PARTIAL_PROFIT|-{PARTIAL_PROFIT_PCT:.1%}", current_qty * 0.5
-
-        if wallet["trough_price"] is not None and wallet["trough_price"] <= entry * (1 - PARTIAL_PROFIT_PCT):
-            trail_stop = wallet["trough_price"] * (1 + TRAILING_STOP_PCT)
-            if price >= trail_stop:
-                return "SELL", f"TRAILING_STOP|trough={wallet['trough_price']:.0f}", current_qty
-
-        if final_signal in ("BUY", "SELL"):
-            return "SELL", "SELL_SIGNAL", current_qty
-
-        return "HOLD", "", 0.0
-
-    return "HOLD", "", 0.0
-
-
-# -------------------- LOG & DAY --------------------
-
-def reset_day_if_needed(wallet: dict, price: float):
-    today = datetime.now(timezone.utc).date().isoformat()
-    if wallet.get("day") != today:
-        wallet["day"] = today
-        wallet["day_start_value"] = get_portfolio_value(wallet, price)
-        wallet["day_halted"] = False
-
+# -------------------- LOGGING --------------------
 
 def log_row(row: list):
-    file_exists = os.path.isfile(LOG_FILE)
-    with open(LOG_FILE, "a", newline="") as f:
+    file_exists = os.path.isfile(cfg.LOG_FILE)
+    with open(cfg.LOG_FILE, "a", newline="") as f:
         writer = csv.writer(f)
         if not file_exists:
             writer.writerow([
-                "timestamp", "symbol", "action", "signal", "reason", "price",
-                "trade_qty", "cash", "coin_qty", "portfolio_value",
-                "ema_short", "ema_long", "rsi", "adx", "atr",
-                "funding", "fg", "ob_imbalance", "size_mult"
+                "timestamp", "symbol", "action", "reason", "signal",
+                "price", "fill_price", "qty", "fee", "realized_pnl",
+                "cash", "margin_locked", "equity", "position_side",
+                "position_id", "funding_paid",
             ])
         writer.writerow(row)
 
@@ -469,195 +166,80 @@ def main():
     start = time.time()
     state = load_state()
     timestamp = datetime.now(timezone.utc).isoformat()
+    today = datetime.now(timezone.utc).date().isoformat()
 
-    fg = fetch_fear_greed()
-    print(f"[GLOBAL] Fear & Greed: {fg['value']} ({fg['class']})")
-
-    for symbol in COINS:
+    for symbol in cfg.COINS:
         try:
             print(f"\n[ANALYZING] {symbol}")
-
-            df_15m = fetch_klines(symbol, PRIMARY_INTERVAL, 150)
-            df_1h = fetch_klines(symbol, TREND_INTERVAL, 150)
-
-            if df_15m.empty or df_1h.empty:
-                print(f"[SKIP] {symbol} - missing data")
+            df = fetch_klines(symbol, limit=cfg.SWEEP_LOOKBACK_CANDLES + 20)
+            if df.empty or len(df) < cfg.SWEEP_LOOKBACK_CANDLES + 2:
+                print(f"[SKIP] Not enough kline data for {symbol}.")
                 continue
 
-            df_15m = compute_indicators(df_15m)
-            df_1h = compute_indicators(df_1h)
+            oi_df = fetch_oi_hist(symbol, limit=cfg.OI_DELTA_LOOKBACK_CANDLES + 6)
+            df = eng.align_oi(df, oi_df)
+            df = eng.add_atr(df, cfg.ATR_PERIOD)
+            df = eng.add_sweep_signal(df)
+            df = eng.add_oi_delta(df)
 
-            base_signal = generate_signal(df_15m)
-            price = float(df_15m.iloc[-1]["close"])
-            atr = float(df_15m.iloc[-1]["atr"])
-            adx = float(df_15m.iloc[-1]["adx"])
-            move = recent_move_pct(df_15m)
+            latest = df.iloc[-1]
+            price = float(latest["close"])
+            candle_high = float(latest["high"])
+            candle_low = float(latest["low"])
+            atr = float(latest["atr"]) if pd.notna(latest["atr"]) else None
+            funding = fetch_funding_rate(symbol)
 
-            with ThreadPoolExecutor(max_workers=2) as ex:
-                f_funding = ex.submit(fetch_funding_rate, symbol)
-                f_ob = ex.submit(fetch_order_book, symbol)
-                try:
-                    funding = f_funding.result(timeout=10)
-                except:
-                    funding = 0.0
-                try:
-                    ob = f_ob.result(timeout=10)
-                except:
-                    ob = {"imbalance": 0.0}
-
-            print(f"  Price=\( {price:,.2f} | ADX={adx:.1f} | ATR= \){atr:,.2f} | Funding={funding:.4%} | OB={ob['imbalance']:+.2f}")
-
-            final_signal, filter_reason, size_mult = apply_filters(
-                symbol, base_signal, df_15m, df_1h, funding, fg, ob
-            )
-            print(f"  Base={base_signal} | Final={final_signal} | Size={size_mult:.0%} | {filter_reason}")
+            final_signal = eng.generate_signal(latest)
+            print(f"  Price={price:,.2f} | sweep={latest.get('sweep_signal')} | "
+                  f"oi_chg={latest.get('oi_pct_change')} | signal={final_signal} | "
+                  f"funding={funding:.4%}")
 
             wallet = state["coins"][symbol]
-            reset_day_if_needed(wallet, price)
+            eng.reset_day_if_needed(wallet, price, today)
+            now_ts = pd.Timestamp(timestamp)
+            funding_paid = eng.apply_funding_if_due(wallet, funding, now_ts)
 
-            if wallet["coin_qty"] > 0 and wallet.get("entry_price") is None:
-                wallet["entry_price"] = price
-                wallet["peak_price"] = price
-                wallet["trough_price"] = price
-                wallet["position_type"] = "LONG"
-                wallet["partial_sold"] = False
+            action, reason, qty, fill_price = "HOLD", "", 0.0, 0.0
+            fee = 0.0
+            realized_pnl = 0.0
 
-            action = "HOLD"
-            reason = filter_reason
-            trade_qty = 0.0
+            if wallet["position_side"] is not None:
+                action, reason, qty, fill_price = eng.check_exits(
+                    wallet, candle_high, candle_low, price, final_signal)
+                if action != "HOLD" and qty > 0:
+                    realized_pnl, fee = eng.close_position(wallet, fill_price, qty)
+                    print(f"  >> {action} {reason} qty={qty:.6f} @ {fill_price:.2f} "
+                          f"pnl={realized_pnl:+.2f}")
+            elif wallet["day_halted"]:
+                reason = "DAILY_LOSS_HALT"
+            elif final_signal in ("LONG", "SHORT") and atr is not None:
+                stop_dist = max(atr * cfg.ATR_STOP_MULT, price * cfg.STOP_LOSS_PCT)
+                entry_qty, margin, entry_fee = eng.size_position(wallet, price, stop_dist, price)
+                if entry_qty > 0:
+                    eng.open_position(wallet, final_signal, price, entry_qty, margin,
+                                       entry_fee, stop_dist, now_ts=now_ts)
+                    action, reason, qty, fill_price, fee = "OPEN", final_signal, entry_qty, price, entry_fee
+                    print(f"  >> OPEN {final_signal} qty={entry_qty:.6f} @ {price:.2f} "
+                          f"stop={wallet['stop_price']:.2f} liq={wallet['liquidation_price']:.2f}")
+                else:
+                    reason = "SIZING_FAILED"
 
-            # ========== EXIT ==========
-            if wallet["coin_qty"] > 0:
-                exit_action, exit_reason, exit_qty = check_exits(wallet, price, atr, final_signal)
-
-                if exit_action == "SELL":
-                    entry_price_at_exit = wallet.get("entry_price")
-                    was_short = wallet.get("position_type") == "SHORT"
-
-                    proceeds = exit_qty * price
-                    fee = proceeds * FEE_PCT
-
-                    if was_short:
-                        wallet["cash"] -= (proceeds + fee)
-                    else:
-                        wallet["cash"] += proceeds - fee
-
-                    wallet["coin_qty"] -= exit_qty
-
-                    if wallet["coin_qty"] <= 1e-9:
-                        wallet["coin_qty"] = 0.0
-                        wallet["entry_price"] = None
-                        wallet["peak_price"] = None
-                        wallet["trough_price"] = None
-                        wallet["position_type"] = None
-                        wallet["partial_sold"] = False
-                        wallet["partial_qty"] = 0.0
-
-                    wallet["num_trades"] += 1
-                    trade_qty = exit_qty
-
-                    if entry_price_at_exit is not None:
-                        won = (price < entry_price_at_exit) if was_short else (price > entry_price_at_exit)
-                        if won:
-                            wallet["win_trades"] = wallet.get("win_trades", 0) + 1
-                        else:
-                            wallet["loss_trades"] = wallet.get("loss_trades", 0) + 1
-
-                    action = "SELL"
-                    reason = exit_reason
-
-                elif exit_action == "PARTIAL":
-                    proceeds = exit_qty * price
-                    fee = proceeds * FEE_PCT
-                    if wallet.get("position_type") == "SHORT":
-                        wallet["cash"] -= (proceeds + fee)
-                    else:
-                        wallet["cash"] += proceeds - fee
-                    wallet["coin_qty"] -= exit_qty
-                    wallet["partial_sold"] = True
-                    wallet["partial_qty"] = exit_qty
-                    wallet["num_trades"] += 1
-                    trade_qty = exit_qty
-                    action = "PARTIAL"
-                    reason = exit_reason
-
-            # ========== ENTRY ==========
-            elif not wallet["day_halted"]:
-                if final_signal == "BUY" and wallet["cash"] > 0:
-                    if move < MIN_MOVE_PCT:
-                        action = "HOLD"
-                        reason = "SKIP_SMALL_MOVE"
-                    elif size_mult <= 0:
-                        action = "HOLD"
-                        reason = filter_reason
-                    else:
-                        qty, spend = calculate_position(wallet, price, atr, size_mult)
-                        if qty > 0:
-                            wallet["coin_qty"] += qty
-                            wallet["cash"] -= spend
-                            wallet["entry_price"] = price
-                            wallet["peak_price"] = price
-                            wallet["position_type"] = "LONG"
-                            wallet["partial_sold"] = False
-                            wallet["partial_qty"] = 0.0
-                            wallet["num_trades"] += 1
-                            trade_qty = qty
-                            action = "BUY"
-                            reason = f"BUY|{filter_reason}|size={size_mult:.0%}"
-
-                elif final_signal == "SHORT" and wallet["cash"] > 0:
-                    if move < MIN_MOVE_PCT:
-                        action = "HOLD"
-                        reason = "SKIP_SMALL_MOVE"
-                    elif size_mult <= 0:
-                        action = "HOLD"
-                        reason = filter_reason
-                    else:
-                        qty, spend = calculate_position(wallet, price, atr, size_mult)
-                        if qty > 0:
-                            wallet["coin_qty"] += qty
-                            wallet["cash"] += spend
-                            wallet["entry_price"] = price
-                            wallet["trough_price"] = price
-                            wallet["position_type"] = "SHORT"
-                            wallet["partial_sold"] = False
-                            wallet["partial_qty"] = 0.0
-                            wallet["num_trades"] += 1
-                            trade_qty = qty
-                            action = "SHORT"
-                            reason = f"SHORT|{filter_reason}|size={size_mult:.0%}"
-
-            # ========== Portfolio ==========
-            value = get_portfolio_value(wallet, price)
-            if value > wallet.get("peak_value", value):
-                wallet["peak_value"] = value
-            dd = (wallet.get("peak_value", value) - value) / wallet.get("peak_value", value) if wallet.get("peak_value", value) > 0 else 0
-            if dd > wallet.get("max_drawdown", 0):
-                wallet["max_drawdown"] = dd
-
-            day_loss = (wallet["day_start_value"] - value) / wallet["day_start_value"] if wallet["day_start_value"] > 0 else 0
-            if day_loss >= MAX_DAILY_LOSS_PCT:
-                wallet["day_halted"] = True
-
-            latest = df_15m.iloc[-1]
+            eq = eng.update_drawdown_and_halt(wallet, price)
             log_row([
-                timestamp, symbol, action, base_signal, reason, price, trade_qty,
-                wallet["cash"], wallet["coin_qty"], value,
-                round(latest["ema_short"], 2), round(latest["ema_long"], 2),
-                round(latest["rsi"], 2), round(adx, 2), round(atr, 2),
-                round(funding, 6), fg["value"], round(ob["imbalance"], 3), round(size_mult, 2)
+                timestamp, symbol, action, reason, final_signal, price, fill_price,
+                qty, round(fee, 4), round(realized_pnl, 4), round(wallet["cash"], 2),
+                round(wallet["margin_locked"], 2), round(eq, 2),
+                wallet["position_side"], wallet.get("current_position_id"),
+                round(funding_paid, 4),
             ])
-
-            total = wallet["num_trades"]
-            wins = wallet.get("win_trades", 0)
-            wr = (wins / total * 100) if total > 0 else 0
-            print(f"  >> Action={action} | Value=${value:,.2f} | WinRate={wr:.1f}% | Type={wallet.get('position_type')}")
+            print(f"  Equity=${eq:,.2f} | position={wallet['position_side']} | "
+                  f"realized_total=${wallet.get('realized_pnl_total', 0):,.2f}")
 
         except Exception as e:
-            print(f"[ERROR] {symbol}: {e}")
+            print(f"[ERROR] Critical failure processing {symbol}: {e}")
 
     save_state(state)
-    print(f"\n[DONE] {time.time() - start:.2f}s")
+    print(f"\n[DONE] Completed in {time.time() - start:.2f}s")
 
 
 if __name__ == "__main__":
